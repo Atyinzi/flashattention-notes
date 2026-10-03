@@ -1,75 +1,64 @@
 # flashattention-notes
 
-《万字长文详解 FlashAttention v1/v2》的**结构化学习笔记**。
+FlashAttention v1 / v2 的学习笔记，从**原始论文**整理而成：
 
-> 原文：[万字长文详解 FlashAttention v1/v2](https://zhuanlan.zhihu.com/p/642962397) — 作者 Civ，收录于知乎专栏《Large Language Model》。
+- [FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness](https://arxiv.org/abs/2205.14135)（arXiv:2205.14135）
+- [FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning](https://arxiv.org/abs/2307.08691)（arXiv:2307.08691）
+- [Self-attention Does Not Need O(n²) Memory](https://arxiv.org/abs/2112.05682)（arXiv:2112.05682）
 
 ---
 
-## 内容
+## 文件
 
 | 文件 | 说明 |
 | --- | --- |
-| [docs/FlashAttention-v1-v2-学习笔记.md](docs/FlashAttention-v1-v2-学习笔记.md) | 完整学习笔记：背景与动机 → FA v1 → FA v2 → EMA/xformers → 基准测试 + 全部 48 个公式附录（内嵌原文图表） |
-| [docs/原文提取文本.md](docs/原文提取文本.md) | 从源 PDF 提取的原文文本（供逐句核对） |
-| [assets/figures-index.md](assets/figures-index.md) | 原文图表清单（图 2–图 11，按页渲染） |
-
-笔记结构：
-
-```
-0. 记号与术语对照
-1. 背景与动机        Transformer 复杂度 / FLOPs 与 MAC / 核心思路（GPU 存储层级、分块）
-2. FlashAttention v1 在线 softmax 推导 / 前向伪代码逐行对照 / MAC 分析 / 反向显存技巧 /
-                     Block-Sparse 变体 / 实验结果
-3. FlashAttention v2 算法（去掉每步除法 + Causal Mask 跳块）/ 并行策略 / Work Partitioning /
-                     实验结果
-4. EMA 与 xformers   空间复杂度 O(n²)→O(n) 的在线累加推导
-5. 基准测试代码索引
-6. 复习清单（自测题 15 问）
-附录 A. 全部 48 个编号公式
-附录 B. 参考资料
-```
+| [docs/FlashAttention-v1-v2-学习笔记.md](docs/FlashAttention-v1-v2-学习笔记.md) | 主笔记：算术强度与 IO → 在线 softmax 推导 → FA v1 → FA v2 → EMA → 实践建议，含速查表与 15 道自测题 |
+| [assets/figures/](assets/figures/) | 自制示意图（SVG，可缩放） |
 
 ---
 
 ## 三句话抓住主线
 
-1. **出发点**：Transformer 的瓶颈不只是 FLOPs。FlashAttention 把优化目标从「少算」改成「**少搬运**」——降低 HBM 与 SRAM 之间的存储访问开销（MAC）。
-2. **手段**：**分块（tiling）+ 在线 softmax 动态重缩放 + 重算代替保存**。中间矩阵 $S,P$ 永远不落 HBM，MAC 从 $O(N^2)$ 降到 $O(N^2d^2/M)$，并且**数学结果与标准注意力一致**（精确算法，非近似）。
-3. **v1 → v2**：v1 已比标准实现快 2–4×，但 A100 上吞吐量只有极限的 30–50%；v2 通过「**放宽在线 softmax 的缩放时机** + **把行方向分块纳入并行** + **以 $K,V$（v1）改为以 $Q$（v2）做 warp 切分**」把吞吐量推到 **230 TFLOPs/s（A100 极限的 73%）**。
+1. **瓶颈不在算得多，而在搬得多**。softmax 是 memory-bound 归约操作，标准实现必须把 $N\times N$ 的 $\mathbf{S},\mathbf{P}$ 物化到 HBM 并来回搬运三次 —— 耗时主要由访存而非 FLOPs 决定。
+2. **用"分块 + 在线 softmax + 重算"把这三次搬运消掉**。沿途只保留 $O(N)$ 的统计量 $(m,\ell)$，中间矩阵从不落 HBM。HBM 访问从 $\Omega(Nd+N^2)$ 降到 $\Theta(N^2d^2M^{-1})$，显存从 $O(N^2)$ 降到 $O(N)$，而**输出与标准注意力完全一致（非近似）**。
+3. **v2 的主线是"砍掉 matmul 之外的开销"**。A100 上非 matmul FLOPs 的单位成本是 matmul 的 **16 倍**，所以 v2 减少每步除法、把并行度扩展到序列方向、并把 warp 切分从 $K,V$ 改成 $Q$ 以消除同步与部分和归约 —— 前向吞吐从峰值 30–50% 提到 50–73%。
 
 ---
 
 ## 关键结论速查
 
-| 项目 | 标准 Self-Attention | FlashAttention v1 | FlashAttention v2 |
+| | 标准注意力 | FlashAttention v1 | FlashAttention-2 |
 | --- | --- | --- | --- |
-| 时间复杂度 | $O(N^2d)$ | $O(N^2d)$（略增，重算换 IO） | 同 v1 |
-| 空间复杂度 | $O(N^2)$ | $O(N)$（不物化 $S,P$） | $O(N)$ |
-| MAC（HBM 访问） | $O(N^2)$ | $O(N^2d^2/M)$ | 同 v1 |
-| 并行维度 | batch × head | batch × head | batch × head **× 行分块（外循环）** |
-| warp 切分对象 | — | $K,V$（结果需相加 + 同步） | $Q$（结果直接拼接，**无需通信**） |
-| 反向保存量 | $S,P$、Dropout Mask | $O$、$m$、$\ell$ + RNG 状态 | 合并为 $L_i=\log\ell_i+m_i$ |
+| 时间复杂度（FLOPs） | $O(N^2d)$ | $O(N^2d)$（重算略增） | 同 v1 |
+| 空间复杂度 | $O(N^2)$ | $O(N)$ | $O(N)$（再省一个向量） |
+| HBM 访问次数 | $\Omega(Nd+N^2)$ | $\Theta(N^2d^2M^{-1})$ | 同 v1 |
+| 并行维度 | batch × head | batch × head | batch × head **× 行分块** |
+| warp 切分对象 | — | $K,V$（需同步 + 求和） | $Q$（直接拼接，无需通信） |
+| 反向保存 | $\mathbf{S},\mathbf{P}$、dropout mask | $(m,\ell)$ 两个向量 | $L=m+\log\ell$ 一个向量 |
+| 前向吞吐（A100 峰值占比） | — | 30–50% | **50–73%** |
+| 反向吞吐 | — | 25–35% | **63%** |
+| 相对标准注意力 | 1× | 2–4× | **3–10×** |
 | 是否精确 | 基准 | ✅ 精确 | ✅ 精确 |
-| 相对速度 | 1× | 2–4× | 3–10×（比 v1 再快 1.3–3×） |
 
-**两个"唯一"要记住**：
+**两个"唯一"要记住**
 
-- 全文唯一**近似**变体是 **Block-Sparse FlashAttention**（被 mask 的分块直接跳过）；
-- 唯一**不是为了加速而是为了省显存**的算法是 **EMA**（空间 $O(n^2)\to O(n)$，代价是耗时 +10%~15%；序列长 16,384 时显存 1 GB → 17 MB）。
+- 唯一的**近似**变体是 **Block-Sparse FlashAttention**（跳过被 mask 的块，比 FA 再快 2–4×，可扩展到 64K 序列）；
+- 唯一以**省显存**为首要目标（而非省 IO）的是 **EMA**：空间 $O(n^2)\to O(n)$，代价是耗时增加。
 
 ---
 
 ## 阅读建议
 
-- **第一次读**：1.2 → 1.3 → 2.1 → 3.1，先把"为什么 IO 是瓶颈"和"在线 softmax 怎么重缩放"弄明白。
-- **抠细节**：2.2 的伪代码逐行对照表 + 附录 A 的公式编号，两者配合看原论文 `Algorithm 1` 最快。
-- **面试/自测**：直接做第 6 节的 15 道题，答不上来再回查对应小节。
+- **先建立直觉**：1.1 → 1.2，搞清 arithmetic intensity 与"为什么 FLOPs 不等于时间"。
+- **再抠核心推导**：第 2 节是全文最值得亲手推一遍的地方，2.3 给了一个可以手算验证的 4 元素例子。
+- **然后看工程**：3.2 的逐行解释与 4.2–4.4 的 v2 三处改进。
+- **最后自测**：附录 B 的 15 道题按概念 / 推导 / 工程分层，答不上来再回查对应小节。
+- **速查**：附录 A 是一页纸总结。
 
 ---
 
-## 关于本仓库
+### 说明
 
-- 定位是**学习笔记**：保留原文的推导主线、章节顺序与全部编号公式，并补充术语记号对照、结论速查表、自测清单与公式附录。
-- 原文 PDF 中公式为矢量图形、无法直接复制文本，附录 A 的公式由页面图像 OCR 结合上下文语义恢复；个别上下标排版可能与原文略有差异，**以原论文为准**。
-- 原文版权归原作者 Civ 所有；本仓库仅用于个人学习与检索。
+公式、伪代码、复杂度结论与实验数字均取自上述论文正文，引用见笔记附录 C。
+示意图为自制（SVG），手算验证示例与总结性表格为整理者补充。
+若发现与论文不一致之处，**以论文为准**。

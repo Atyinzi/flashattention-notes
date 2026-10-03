@@ -1,751 +1,723 @@
 # FlashAttention v1 / v2 学习笔记
 
-> 本文是对知乎专栏文章 [《万字长文详解 FlashAttention v1/v2》](https://zhuanlan.zhihu.com/p/642962397)（作者 Civ）的**结构化学习笔记**。
-> 原文章节以「背景 & 动机 → FlashAttention v1 → FlashAttention v2 → Efficient Memory Attention → 基准测试」展开，
-> 本笔记保留其推导主线与全部 48 个编号公式，并补充术语、记号对照与可复现的代码索引。
-
-- **一句话总结**：FlashAttention 是一类 **IO 感知（IO-aware）的精确注意力算法**——它通过 **分块（tiling）+ 在线 softmax 重缩放（online softmax rescaling）** 把注意力计算全部留在 SRAM 中完成，从而把 HBM 访问量从 $O(N^2)$ 降到 $O(N^2 d^2/M)$，用「多算一点（重算 / 不物化中间矩阵）」换取「少搬运很多」。
-- **它不是近似算法**（v1/v2 主体部分）：数学结果与标准 Self-Attention 一致，仅存在浮点数值上的微小差异。文中唯一的近似变体是 **Block-Sparse FlashAttention**。
-- **v1 → v2 的杠杆**：v1 已经比标准实现快 2–4×，但 A100 上前向吞吐量仅达极限的 30–50%、反向 25–35%；v2 通过 **放宽在线 softmax 的缩放时机（Algorithm）+ 把行方向分块也纳入并行（Parallelism）+ 以 $K/V$ 而非 $Q/K/V$ 做 warp 切分（Work Partitioning）**，把吞吐量推到 A100 极限的 73%（230 TFLOPs/s）。
+> 从原始论文出发整理：FlashAttention（arXiv:2205.14135）、FlashAttention-2（arXiv:2307.08691）、
+> Self-attention Does Not Need O(n²) Memory（arXiv:2112.05682）。
+> 全部推导、伪代码与复杂度结论均以论文正文为准，文末给出引用。
 
 ---
 
 ## 目录
 
-- [0. 记号与术语对照](#0-记号与术语对照)
-- [1. 背景与动机](#1-背景与动机)
-- [2. FlashAttention v1](#2-flashattention-v1)
-- [3. FlashAttention v2](#3-flashattention-v2)
-- [4. Efficient Memory Attention（EMA）与 xformers](#4-efficient-memory-attentionema与-xformers)
-- [5. 基准测试代码索引](#5-基准测试代码索引)
-- [6. 复习清单（自测）](#6-复习清单自测)
-- [附录 A. 全部编号公式](#附录-a-全部编号公式)
-- [附录 B. 参考资料](#附录-b-参考资料)
+- [0. 记号约定](#0-记号约定)
+- [1. 问题的根源：算术强度与 IO](#1-问题的根源算术强度与-io)
+- [2. 在线 softmax：把归一化拆到分块上](#2-在线-softmax把归一化拆到分块上)
+- [3. FlashAttention v1](#3-flashattention-v1)
+- [4. FlashAttention-2](#4-flashattention-2)
+- [5. 另一种思路：EMA](#5-另一种思路ema)
+- [6. 什么时候该用 FlashAttention](#6-什么时候该用-flashattention)
+- [附录 A. 一张纸速查](#附录-a-一张纸速查)
+- [附录 B. 自测题](#附录-b-自测题)
+- [附录 C. 参考文献](#附录-c-参考文献)
 
 ---
 
-## 0. 记号与术语对照
+## 0. 记号约定
 
-| 符号 | 含义 | 备注 |
-| --- | --- | --- |
-| $N$ | 序列长度 | 原文中有时记作 $n$ |
-| $d$ | 单头维度（head dim） | |
-| $B_r,\ B_c$ | 分块的行数 / 列数 | $B_r$ 用于 $Q$ 与 $O$，$B_c$ 用于 $K$ 与 $V$ |
-| $T_r,\ T_c$ | 分块个数，$T_r=\lceil N/B_r\rceil,\ T_c=\lceil N/B_c\rceil$ | |
-| $M$ | SRAM 容量（A100 约 100–192 KB 级） | |
-| HBM | High Bandwidth Memory，显存，容量大但带宽相对低 | A100：40–80 GB |
-| SRAM | Static RAM，片上共享内存，带宽极高但容量小 | 分块必须放得下 |
-| FLOPs | Floating Point Operations，**浮点运算总次数**（工作量） | ⚠️ 不是 FLOP/s |
-| FLOP/s | Floating Point Operations **Per Second**（吞吐率） | 原文评论区指出该处用词混淆 |
-| MAC | Memory Access Cost，**存储访问开销**（读写字节数 / 次数） | 本笔记的核心优化目标 |
-| Compute-bound | 计算密集型算子，耗时由 FLOPs 决定 | 大矩阵乘法、大 channel 卷积 |
-| Memory-bound | 存储访问密集型算子，耗时由 MAC 决定 | ReLU、Dropout、求和、softmax、BatchNorm |
-| EXP 求和项 | softmax 分母 $\sum_j e^{x_j-m}$ | 原文自造的说法，见公式 (7) |
-| 局部 / 全局 | 只用某个分块信息算出的量 / 用全部分块信息算出的量 | 在线 softmax 的核心概念 |
-| LSE | Log-Sum-Exp，$\log\sum_j e^{x_j}$ | v2 反向传播合并变量时出现 |
-
----
-
-## 1. 背景与动机
-
-### 1.1 Transformer 的复杂度
-
-给定三个 $N\times d$ 的矩阵 $Q,K,V\in\mathbb{R}^{N\times d}$，标准 Self-Attention（略去缩放因子 $\sqrt d$，下同）：
-
-```text
-(1)  S = Q Kᵀ        ∈ R^{N×N}
-(2)  P = softmax(S)  ∈ R^{N×N}
-(3)  O = P V         ∈ R^{N×d}
-```
-
-- $Q,K,V$ 由原始输入经线性变换得到；
-- $S$ 常被称为 **Attention Scores**；
-- $P$ 是对 $S$ **逐行** 做 softmax 的结果，可理解为 Normalized Attention Scores 或 **Attention Weights**；
-- $O$ 是最终输出；$N$ 是序列长度，$d$ 是维度。
-
-**复杂度**：公式 (1) 与 (3) 是串行执行的两个 $N\times d$ 与 $d\times N$（及 $N\times N$ 与 $N\times d$）矩阵乘法，各自复杂度为 $O(N^2 d)$，因此
-
-```text
-Self-Attention 时间复杂度 = O(N² d)         即随 N 二次增长
-Self-Attention 空间复杂度 = O(N²)  (当 N ≫ d)
-```
-
-> 原文用大 $O$（上界）而非原论文的 $\tilde O$（精确界）。二者的差别只是「上界」与「紧确界」；因为 $M\le N$ 时对应的大 $O$ 也成立，所以用大 $O$ 叙述不影响结论。
-
-**工程含义**：Transformer 的上下文长度因此长期受限（早期 LLM 普遍 2k / 4k）。如今 32k 已是标配、百万 token 也不罕见——**但这不改变复杂度是 $O(N^2)$ 这一事实**，它只是把问题推给了更长的序列与更贵的显存。
-
-### 1.2 FLOPs & MAC：为什么"更省计算"不等于"更快"
-
-- FLOPs 定义模型核心计算的密集程度，与计算速度关系很大；
-- 学术界大量 **Efficient Transformer** 只盯着降低 FLOPs，但 FlashAttention 作者发现：**它们的 FLOPs 确实降了，速度却没有显著变快**；
-- 根因在于计算速度同时取决于 **MAC**。尤其当计算本身已经很高效率时，MAC 的占比越发不可忽视。MAC 开销来自两处：**从存储读数据** 与 **向存储写数据**（GPU 上即显存 ↔ 计算单元之间的搬运）。
-
-按计算密集程度把 operator 分成两类：
-
-| 类型 | 耗时主要来自 | 典型算子 | 决定耗时的量 |
-| --- | --- | --- | --- |
-| **Compute-bound** | 计算本身（读写耗时低） | 大矩阵乘法、大 channel size 卷积 | FLOPs |
-| **Memory-bound** | 存储访问 | 逐元素操作（ReLU、Dropout）、Reduce 操作（求和、softmax、BatchNorm） | MAC |
-
-两点结论：
-
-1. 绝大多数神经网络含有大量 Memory-bound 操作，所以 MAC 不能忽略；而绝大多数 Efficient Transformer 忽略了它——这正是「FLOPs 降了、时耗没降」的原因。
-2. **即使对传统意义上的 Compute-bound 操作（如大矩阵乘法），当计算本身已经非常高效时，MAC 开销也会变成瓶颈。FlashAttention 主要解决的正是这一类问题。**
-
-> 同类研究动机的先例：CV 领域的 **ShuffleNet v2**（缅怀前辈）在轻量化模型只关注 FLOPs 的潮流中，同样强调了 MAC。
-
-### 1.3 核心思路：用 SRAM 换 HBM，用 FLOPs 换 MAC
-
-**目标：降低 MAC，即使代价是增加 FLOPs。**
-
-**GPU 存储层级（以 A100 为例）**
-
-```text
-        ┌──────────────────────── 容量大、带宽相对低 ────────────────────────┐
-        │  HBM (High Bandwidth Memory)  40–80 GB                            │
-        └───────────────▲───────────────────────────────┬──────────────────┘
-                        │  数据搬运 = MAC（要尽量少）      │
-        ┌───────────────┴───────────────────────────────▼──────────────────┐
-        │  SRAM (on-chip, Static RAM)  ~100–192 KB / SM                     │
-        │  读写速度快得多，但空间远小于 HBM                                  │
-        └──────────────────────────────────────────────────────────────────┘
-```
-
-![图 2 GPU 存储结构示意图 / 图 3 标准 Transformer 的计算过程](../assets/figures/fig02-03-gpu-hierarchy-and-transformer-io.jpg)
-
-- **SRAM 读写速度远大于 HBM，但空间远小于 HBM**（A100：SRAM 19 TB/s / 20 MB，HBM 1.5 TB/s / 40 GB，CPU DRAM 12.8 GB/s / >1 TB）；
-- 标准 Transformer 的计算过程主要使用 HBM，涉及 **8 次 HBM 矩阵读写**（对应图 3 的三行）：第一行读 $Q,K$ 两次、写 $S$ 一次（共 3 次）；第二行读 $S$ 一次、写 $P$ 一次（2 次）；第三行读 $P,V$ 两次、写 $O$ 一次（3 次）；
-- **FlashAttention 的做法**：把参与计算的矩阵 **分块（tile）** 送进 SRAM，在片上算完再写回，从而减少 HBM 读写总量。
-- 难点：对普通矩阵乘法，分块很自然；但对 Self-Attention **不直观**，因为 softmax 的分母是一个依赖所有元素的求和项 —— 所以必须先解决 **softmax 的分块（在线）计算**。
-
----
-
-## 2. FlashAttention v1
-
-对 Self-Attention 做分块，真正难点是 **softmax 的分块计算**（$P=\mathrm{softmax}(S)$）。本节先给出在线 softmax 的推导（2.1），再对照论文伪代码走一遍前向（2.2），然后做 MAC 分析（2.3）。
-
-### 2.1 Softmax 的动态更新（在线 softmax / online softmax）
-
-#### 2.1.1 标准 softmax 与其数值问题
-
-对维度为 $B$ 的向量 $x\in\mathbb{R}^B$：
-
-```text
-(4)  softmax(x₍ᵢ₎) = e^{x₍ᵢ₎} / Σⱼ e^{xⱼ}      i = 1..B
-```
-
-分子分母都含指数项，因此**既可能上溢也可能下溢**：
-
-- 上溢：指数项 $e^{x_i}$ 中 $x_i$ 较大时值容易很大。例如 float32 下 $x_i\approx 88$ 时 $e^{x_i}$ 就会上溢；
-- 下溢：当 $x$ 中每个元素都是较大的负值时，每个 $e^{x_i}$ 都可能下溢，分母为 0，整个式子因被除数为 0 而未定义。
-
-#### 2.1.2 稳定版 softmax
-
-几乎所有深度学习框架都使用 **稳定版**：先减去向量最大值。
-
-```text
-(5)  m(x)  = max([x₁, x₂, ..., x_B])                      ← 向量最大值
-(6)  f(x)  = [ e^{x₁−m(x)}, e^{x₂−m(x)}, ..., e^{x_B−m(x)} ]
-(7)  ℓ(x)  = Σⱼ f(x)ⱼ                                       ← "EXP 求和项"
-(8)  softmax(x) = f(x) / ℓ(x)                               ← 逐元素相除
-```
-
-其中 $\ell(x)$ 是分母的求和项（原文称 **"EXP 求和项"**），$f(x)_i$ 表示向量 $f(x)$ 的第 $i$ 个元素。
-
-**为什么能同时解决上溢和下溢**：每个 $x_i$ 减去最大值 $m(x)$ 后，分子最大只可能是 $e^0=1$，没有上溢可能；分母中至少有一项是 $e^0=1$，因此分母不会为 0。
-
-**分块为什么难**：$\ell(x)$ 依赖于输入向量中的**每一个值**。
-
-#### 2.1.3 把向量"一切为二"：局部量
-
-把大小 $2B$ 的向量 $x$ 一分为二：
-
-```text
-x = [ x⁽¹⁾ , x⁽²⁾ ] ,   x⁽¹⁾, x⁽²⁾ ∈ R^B
-```
-
-即 $x^{(1)}$ 是前半部分、$x^{(2)}$ 是后半部分。先处理 $x^{(1)}$，用 (5)–(8) 计算它的**局部 softmax**：
-
-```text
-(9)   m(x⁽¹⁾)  = max([x₁⁽¹⁾, x₂⁽¹⁾, ..., x_B⁽¹⁾])
-(10)  f(x⁽¹⁾)  = [ e^{x₁⁽¹⁾−m(x⁽¹⁾)}, ..., e^{x_B⁽¹⁾−m(x⁽¹⁾)} ]
-(11)  ℓ(x⁽¹⁾)  = Σⱼ f(x⁽¹⁾)ⱼ
-(12)  softmax(x⁽¹⁾) = f(x⁽¹⁾) / ℓ(x⁽¹⁾)
-```
-
-由 (9)–(12) 得到的 $\mathrm{softmax}(x^{(1)})$ **不是最终结果**，原因有二：
-
-- (10) 中减去的最大值应当是整个向量 $x$ 的最大值 $m(x)$，而不是子向量的 $m(x^{(1)})$；
-- (12) 中分母的 EXP 求和项应当是**关于整个向量 $x$** 的求和，而不仅是关于 $x^{(1)}$ 的求和。
-
-所以称其为 **"局部的"**。
-
-#### 2.1.4 保存额外标量并处理第二个分块
-
-处理完 $x^{(1)}$ 后，只需要保存两个标量：$m(x^{(1)})$ 与 $\ell(x^{(1)})$（相比整个子向量，开销小得多）。此外还需保存两个**全局标量**：
-
-- $m_{\max}$：**当前最大值**。目前只处理完 $x^{(1)}$，所以 $m_{\max}=m(x^{(1)})$；
-- $\ell_{\max}$：**全局 EXP 求和项**。同理 $\ell_{\max}=\ell(x^{(1)})$。
-
-接着处理 $x^{(2)}$：
-
-```text
-(13)  m(x⁽²⁾)  = max([x₁⁽²⁾, x₂⁽²⁾, ..., x_B⁽²⁾])
-(14)  f(x⁽²⁾)  = [ e^{x₁⁽²⁾−m(x⁽²⁾)}, ..., e^{x_B⁽²⁾−m(x⁽²⁾)} ]
-(15)  ℓ(x⁽²⁾)  = Σⱼ f(x⁽²⁾)ⱼ
-(16)  softmax(x⁽²⁾) = f(x⁽²⁾) / ℓ(x⁽²⁾)          ← 同样是"局部"的
-```
-
-此时 (16) 得到的仍是局部的。但处理完 $x^{(2)}$ 后，就可以用新信息更新前面保存的两个全局标量。
-
-**先更新 $m_{\max}$**（注意：此时只算出了新的 max 值，**不能**立刻替换旧的 $m_{\max}$，因为后面还要用旧值）：
-
-```text
-(17)  m_max^new = max([ m_max , m(x⁽²⁾) ])
-```
-
-含义很简单：更新后的全局最大值就是「旧全局最大值」与「本分块最大值」中更大的那个。
-
-**再更新 $\ell_{\max}$**：
-
-```text
-(18)  ℓ_max^new = e^{m_max − m_max^new} · ℓ_max  +  e^{m(x⁽²⁾) − m_max^new} · ℓ(x⁽²⁾)
-```
-
-正确性推导：以 $\ell(x^{(2)})$ 为例，说它是"局部的"是因为它**只用了 $x^{(2)}$ 的信息**。把 (15) 稍微展开：
-
-```text
-(19)  ℓ(x⁽²⁾) = Σⱼ e^{xⱼ⁽²⁾ − m(x⁽²⁾)}
-```
-
-导致它是"局部"而非"全局"的原因，就是它减去的 max 是局部的 $m(x^{(2)})$。只需把这个 max 换成全局的：
-
-```text
-(20)  ℓ(x⁽²⁾) · e^{m(x⁽²⁾) − m_max^new} = Σⱼ e^{xⱼ⁽²⁾ − m_max^new}
-```
-
-此时 $\ell$ 已更新为"全局的"。
-
-> **通用规则**：要把某个 EXP 求和项 $\ell$ 更新为"全局的"，只要乘上一个项
-> ```text
-> e^{ m_local − m_global }
-> ```
-> 其中 $m_{\text{local}}$ 表示当前 $\ell$ 对应的（局部）最大值，$m_{\text{global}}$ 表示当前全局最大值。
-
-回到 (18)：$\ell^{(1)}$ 对应的最大值是 $m(x^{(1)})$、当前全局最大值是 $m_{\max}^{\text{new}}$，所以乘 $e^{m(x^{(1)})-m_{\max}^{\text{new}}}$ 更新 $\ell^{(1)}$（等式右方第一项）；同理用 $e^{m(x^{(2)})-m_{\max}^{\text{new}}}$ 更新 $\ell^{(2)}$（第二项）；两项求和即得当前的全局 EXP 求和项。
-
-**再更新 softmax 值本身**。参考 (16)，当前**分子和分母都是局部的**，需要分别更新至全局。先看分子 $f(x^{(2)})$（由 (14) 定义）：
-
-```text
-(21)  f(x⁽²⁾) · e^{m(x⁽²⁾) − m_max^new} = [ e^{x₁⁽²⁾−m_max^new}, ..., e^{x_B⁽²⁾−m_max^new} ]
-```
-
-此时每一项都是"全局的"。**很容易发现：更新 $f$ 的方法与更新 $\ell$ 其实一样，都是乘上同一个项 $e^{m_{\text{local}}-m_{\text{global}}}$。**
-
-先把 (16) 的分子乘上它，把分子更新为"全局的"：
-
-```text
-(22)  softmax(x⁽²⁾)^new_num = f(x⁽²⁾) · e^{m(x⁽²⁾) − m_max^new} / ℓ(x⁽²⁾)
-```
-
-注意 (22) 只是更新了分子、还没更新分母，所以不是最终结果。离最终结果只差一步：分母中的局部 EXP 求和项 $\ell(x^{(2)})$ 需要被替换成全局项 $\ell_{\max}^{\text{new}}$（已由 (18) 算出）。为完成替换，先乘以 $\ell(x^{(2)})$ 消去分母，再除以 $\ell_{\max}^{\text{new}}$：
-
-```text
-(23)  softmax(x⁽²⁾)^new = (f(x⁽²⁾) · e^{m(x⁽²⁾) − m_max^new}) / ℓ_max^new
-```
-
-把 (22) 与 (23) 合并，即可看清"更新"的来源：
-
-```text
-(24)  softmax(x⁽²⁾)^new = softmax(x⁽²⁾) · [ ℓ(x⁽²⁾) · e^{m(x⁽²⁾) − m_max^new} ] / ℓ_max^new
-```
-
-**更新时所依赖的额外保存量**（公式 (24) 用到的全集）：
-
-- $x^{(2)}$ 的局部 softmax 值 $\mathrm{softmax}(x^{(2)})$
-- $x^{(2)}$ 的局部 EXP 求和项 $\ell(x^{(2)})$
-- $x^{(2)}$ 的局部最大值 $m(x^{(2)})$
-- 全局最大值 $m_{\max}^{\text{new}}$
-- 全局 EXP 求和项 $\ell_{\max}^{\text{new}}$
-
-同理，把前三项里的 $x^{(2)}$ 换成 $x^{(1)}$ 就能更新 $x^{(1)}$ 的 softmax 值。**所有更新过程都不需要 $x^{(1)}$ 或 $x^{(2)}$ 的原始向量值**——这正是它省显存的关键。
-
-**最后（处理完全部分块后）才做真正的全局更新**：
-
-```text
-(25)  m_max^final = m_max^new
-(26)  ℓ_max^final = ℓ_max^new
-```
-
-> **这就是 FlashAttention 对 softmax 值进行动态更新的本质。**
-> 本质上是**增量计算**：先算一个分块的局部 softmax 并保存；处理下一个分块时，用新的全局最大值与全局 EXP 求和项去更新旧值；处理完所有分块后，所有分块的 softmax 值都变成了"全局的"。
-> 注意除当前分块外，其余所有之前分块对应的 max 与 EXP 求和项都还是**更新前**的值——所以 (17)(18) 算出的新值先不能替换旧值。
-
-### 2.2 FlashAttention v1 的前向计算过程（对照论文伪代码）
-
-**算法输入**：
-
-- $Q,K,V\in\mathbb{R}^{N\times d}$，存储于 HBM；
-- SRAM 的大小 $M$。
-
-![图 4 FlashAttention 前向伪代码](../assets/figures/fig04-flashattention-pseudocode.jpg)
-
-逐步对照伪代码（图 4）：
-
-| 行 | 内容 | 笔记 |
-| --- | --- | --- |
-| **Line 1** | 根据 SRAM 大小 $M$ 与维度 $d$ 选择分块大小 $B_r,B_c$ | 选择依据见本节末尾 |
-| **Line 2** | 初始化 $O=(0)_{N\times d}\in\mathbb{R}^{N\times d}$、$\ell=(0)_N\in\mathbb{R}^N$、$m=(-\infty)_N\in\mathbb{R}^N$（写在 HBM） | $\ell$ 记录 EXP 求和项，$m$ 记录每行 Attention Score 的最大值 |
-| **Line 3–4** | 把 $Q$ 沿**行**方向分 $T_r$ 块、每块 $B_r\times d$；把 $\ell,m$ 各分 $T_r$ 个子向量（大小 $B_r$）；把 $K,V$ 沿行方向各分 $T_c$ 块、每块 $B_c\times d$ | 对应关系：$Q,K,V$ 的分块互相对应；$\ell,m$ 与 $O$ 的行分块对应 |
-
-![图 5 各矩阵、向量的分块示意图](../assets/figures/fig05-block-partitioning.jpg)
-| **Line 5** | 外循环，遍历 $1\le i\le T_r$ | |
-| **Line 6** | 把当前 $Q_i$ 由 HBM 读入 SRAM | |
-| **Line 7** | 内循环，遍历 $1\le j\le T_c$ | |
-| **Line 8** | 把当前 $K_j,V_j$ 由 HBM 读入 SRAM | |
-| **Line 9** | 用当前 $Q_i,K_j$ 计算当前分块的 Attention Score $S_{ij}=Q_iK_j^T\in\mathbb{R}^{B_r\times B_c}$ | 标准 Transformer 需要的是整个 $N\times N$ 矩阵；各分块结果如图 6 的蓝/橙区域。**外循环在图 6 中从左到右，内循环从上到下** |
-| **Line 10** | 对 $S_{ij}$ 求每行最大值 $\tilde m_{ij}=\mathrm{rowmax}(S_{ij})\in\mathbb{R}^{B_r}$；据此算指数项 $P_{ij}=\exp(S_{ij}-\tilde m_{ij})\in\mathbb{R}^{B_r\times B_c}$（逐元素）；再求 EXP 求和项 $\tilde\ell_{ij}=\mathrm{rowsum}(P_{ij})\in\mathbb{R}^{B_r}$ | |
-| **Line 11** | 用公式 (17)(18) 分别计算 $m_i^{\text{new}},\ell_i^{\text{new}}$ | ⚠️ **此时不用新值覆盖旧的 $m_i,\ell_i$**，因为旧值还要参与后续计算（见 2.1.4） |
-| **Line 12** | 更新 $O_i\leftarrow\mathrm{diag}(\ell_i^{\text{new}})^{-1}\big(\mathrm{diag}(\ell_i)e^{m_i-m_i^{\text{new}}}O_i+e^{m_i-m_i^{\text{new}}}P_{ij}V_j\big)$，并写回 HBM | 下文详述 |
-| **Line 13** | 更新 $\ell_i\leftarrow\ell_i^{\text{new}},\ m_i\leftarrow m_i^{\text{new}}$ | |
-
-**Line 12 的直观理解**（原文较细，值得单独记）：
-
-![图 6 分块的 Attention Score 示意图（N=12, B_r=3, B_c=2）](../assets/figures/fig06-blocked-attention-scores.jpg)
-
-![图 7 分块 Attention Score 计算的简易示意图](../assets/figures/fig07-softmax-block-update.jpg)
-
-1. **多行一起算的目的只是 Batch 计算**。在图 6 中每个小分块 $S_{ij}$ 有 $B_r$ 行（图中为 3 行），但**行与行之间没有任何数据交互**，只是一种 batch 策略。**真正的分块意义在列上，因为 softmax 是沿着列方向（行内归一化）进行的。** 所以理解时可以想象 $B_r=1$，每次只算一个 $1\times B_c$ 的分块（图 7）。
-2. 用 $x^{(1)}$ 表示某一个分块的 Attention Score 行向量，用 $O_i$ 表示该行最终的输出，$O_i$ 是 $d$ 维向量、初始化为全 0。
-3. 先处理最左侧分块 $x^{(1)}$：用 (5)–(8) 算它的**局部 softmax**，把值写入 $O_i$ 的**前 $B_c$ 个位置**。此时 $O_i$ 只有前两个位置有值（图 7 中 $B_c=2$），其余仍为初始值 0。
-4. 处理第二个分块 $x^{(2)}$：先算局部 softmax，再用 (24) 更新：
-
-   ```text
-   (27)  O_i ← diag(ℓ_i^new)⁻¹ ( diag(ℓ_i) e^{m_i − m_i^new} O_i  +  e^{m_i − m_i^new} P_{ij} V_j )
-   ```
-
-   - $O_i$ 始终是长度 $N$ 的向量，此时只有前两个位置是有效值。等式右方**第一项**是对 (24) 的直接使用，用来更新旧的 softmax 值；因为参与这一项计算的向量只有 $x^{(1)}$，所以结果仍是 $N$ 维向量，只有前两项有效。
-   - 等式右方**第二项**：在 Line 10 的解释中提到 $P_{ij}$ 的真实尺寸是 $[1,B_c]$；图 7 中 $B_c=2$，所以 $P_{ij}V_j$ 是一个二维（$B_c$ 维）向量。
-   - 为了把 $N$ 维向量与 $B_c$ 维向量相加，**需要重新理解 $O_i$ 的含义（也是它的真实含义）：$O_i$ 是一个 $N$ 维向量，但它的有效值仅分布在"当前正在处理的那个分块"对应的位置上**，分块大小由 $B_c$ 定义。于是这个加法等价于「把一个 $B_c$ 维向量的值写入 $O_i$ 的第 3、4 个位置」（图 8 专门解释了这一点）：
-
-      ![图 8 对公式 (27) 中加法的直观解释](../assets/figures/fig08-vector-add-intuition.jpg)
-5. 处理 $x^{(3)}$ 时继续套用 (24)：
-
-   ```text
-   (28)  softmax(x⁽³⁾)^new = softmax(x⁽³⁾) · [ ℓ(x⁽³⁾) · e^{m(x⁽³⁾) − m_max^new} ] / ℓ_max^new
-   ```
-
-6. **再进一步：直接更新输出 $O$ 而不只是 softmax 值**——只要在每次动态更新完 softmax 之后，乘上其对应的 $V$ 分块即可：
-
-   ```text
-   (29)  O_i = Σⱼ (更新后的 softmax(x⁽ʲ⁾)) · V_j          B_c 对应公式中 V 的列数（示例为 2）
-   ```
-
-   把 (29) 与图 4 伪代码对照可知：**图 4 中的公式只是 (29) 的矩阵版本**。至此，用 (29) 就实现了分块的 Self-Attention 计算。
-
-**关于 $B_r,B_c$ 的选择**：论文中取
-
-```text
-B_r = min( ⌈M / (4d)⌉ , d )        B_c = min( ⌈M / (4d)⌉ , d )
-```
-
-假设 $d=64$、$M=100\text{KB}$，则 $B_r=B_c=\lceil 100\text{KB}/(4\times 64)\rceil\approx 384$。简化起见可直接设 $B_r=B_c=\lceil M/(4d)\rceil$。
-
-从伪代码可知，从 HBM 加载到 SRAM 的主要数据是 $Q_i,K_j,V_j,O_i$，这四个矩阵尺寸都是 $[B_r,d]$（或 $[B_c,d]$），因此它们总的内存开销就是 SRAM 大小 $M$。**也就是说 $B_r,B_c$ 主要依据 SRAM 最大容量来选。** $\ell_i,m_i$ 尺寸远小于上述四个矩阵，可以不计；即使超出 SRAM，也可以稍延后再 load（例如 $O_i$ 在第 9 行算完后可释放，此时再 load $\ell_i,m_i$）。
-
-### 2.3 MAC 分析
-
-![图 9 标准 Transformer 计算的流程（八次 HBM 读写）](../assets/figures/fig09-standard-transformer-io.jpg)
-
-结合图 9（= 图 3，标准 Transformer 流程），以访问单个 float 为基准统计读写次数：
-
-**标准 Transformer**
-
-| 行 | 操作 | MAC 次数 |
-| --- | --- | --- |
-| 第一行 | 读 $Q,K$ | $2Nd$ |
-| 第一行 | 写 $S$ | $N^2$ |
-| 第二行 | 读 $S$ | $N^2$ |
-| 第二行 | 写 $P$ | $N^2$ |
-| 第三行 | 读 $P,V$ | $N^2+Nd$ |
-| 第三行 | 写 $O$ | $Nd$ |
-
-总计 $4N^2+4Nd$，忽略常数项后复杂度为
-
-```text
-标准 Self-Attention 的 MAC = O(N²)
-```
-
-**FlashAttention v1**：主要关注 $K,V$ 的开销，因为 $K,V$ 在**内循环**，其 MAC 占绝大多数。
-
-- 一次完整的内循环需要读取完整的 $K,V$，MAC 开销 $O(Nd)$；
-- 外循环决定内循环执行次数，即 $T_r=N/B_r$ 次。
-
-所以 FlashAttention v1 的开销为
-
-```text
-FA v1 的 MAC = O(N²d²/M)      （外循环次数 × 每次内循环开销）
-```
-
-因为 $M$（约 100 KB）通常远大于 $d$（数 K 字节量级），所以 **FlashAttention v1 的 MAC 远小于标准 Transformer**。
-
-> 原文用 $O$ 而非 $\tilde O$：$O$ 表示上界，$\tilde O$ 表示精确界（既是上界也是下界）。本文用大 $O$ 主要因为它更常见，且 $M\le N$ 时对应的大 $O$ 也成立。
-
-### 2.4 反向过程（Backward Pass）的显存技巧
-
-反向过程与前向高度相关、思路接近，不再赘述细节。除采用类似前向的分块方法来降低 MAC 之外，还用了两个技巧降低整体 Memory 开销：
-
-1. **重算 $S,P$ 而不保存**：反向传播需要矩阵 $S$ 和 $P$ 来计算关于 $Q,K,V$ 的梯度。但可以通过保存输出 $O$ 与最大值 $m$、EXP 求和项 $\ell$ 来**重算** $S$ 和 $P$，从而节省内存开销。
-2. **保存 RNG 状态而非 Dropout Mask**：通过保存前向过程的随机数生成器状态，在反向过程中重新生成 Dropout 的 Mask，从而节约存储所有 Dropout Mask 的开销。
-
-### 2.5 Block-Sparse FlashAttention
-
-为进一步降低 MAC，论文设计了简单的 Block-Sparse FlashAttention：图中蓝色和橙色块正常参与计算（用不同颜色只为区分），**灰色分块被 mask 住、完全不参与计算**，因此总 MAC 降低。
-
-![图 10 Block-Sparse FlashAttention 示意图 / 图 11 FlashAttention 实验结果](../assets/figures/fig10-11-block-sparse-and-results.jpg)
-
-> ⚠️ **Block-Sparse FlashAttention 是一种近似算法，不是精确的 Transformer。** 这是全文唯一非精确的变体。
-
-### 2.6 实验结果
-
-结论很简单：**使用 FlashAttention 可以明显提高计算速度**（v1 相对标准 self-attention 提速 2–4×）。
-
----
-
-## 3. FlashAttention v2
-
-**动机**：v1 虽已把标准 self-attention 提速 2–4×，但**整体吞吐量仍然较低**——A100 上 v1 的 forward 吞吐量只有 GPU 极限的 30%–50%，backward 甚至只有 25%–35%。v2 的目标就是在此基础上进一步提升吞吐量。
-
-v2 的优化点较零散，论文归为三类：**Algorithm、Parallelism、Work Partitioning**。
-
-### 3.1 算法（Algorithm）
-
-#### 3.1.1 前向过程：去掉每步的除法
-
-把 (23) 复制过来作为 (30)：
-
-```text
-(30)  softmax(x⁽²⁾)^new = (f(x⁽²⁾) · e^{m(x⁽²⁾) − m_max^new}) / ℓ_max^new
-```
-
-观察 (30) 的第二、三行：为了把 $x^{(2)}$ 的 softmax 更新至全局，需要做**分母替换**——把局部 EXP 求和项替换为全局的；替换逻辑是**先乘上原来的分母，再除以新的全局 EXP 求和项**。
-
-**关键洞察**：如果 $x$ 被"一分为三"，那么 $x^{(2)}$ 的 softmax 在由 (30) 更新后，处理完 $x^{(3)}$ 时**还要再更新一次**——又要乘以"上一次的全局 EXP 求和项"，并除以此时新的全局 EXP 求和项。也就是说，(30) 里刚除掉的 $\ell_{\max}^{\text{new}}$，在下一次更新时会被乘回来**相互抵消**。
-
-**因此，每次分块计算完毕后不必除以当时的 EXP 求和项，只需等到最后直接除以最终的全局 EXP 求和项即可。**
-
-```text
-(31)  softmax(x⁽²⁾)^partial = f(x⁽²⁾) · e^{m(x⁽²⁾) − m_max^new}      ← 不除分母，也不更新 ℓ
-```
-
-对比 (31) 与 (30)：本质是**每一次迭代都不再除以 EXP 求和项**（(30) 分母处的 $\ell_{\max}^{\text{new}}$）；因为不除了，也就**无需对 EXP 求和项做更新**（无需再乘 $e^{m_{\text{local}}-m_{\text{global}}}$）。直到处理完最后一个分块，直接用此时的全局 EXP 求和项做分母。
-
-**平均值的类比**（原文给的直觉，非常有助于记忆）。假设要算 1 到 10 的平均值，但每次只能算两个数：
-
-- **FA v1 的做法（精确的滚动平均）**：第一次算出前两个数的平均值 $=1.5$，记录已算个数 $N=2$；第二次算前三个数的平均值，需要用之前的 $N=2$ 来更新，$N=3$；以此类推。**每一步算出的都是"前 N 个数精确的平均值"**，有新值来了再更新到新的全局平均值。
-- **FA v2 的做法（滚动求和，最后一次除）**：第一次算出前两个数的**和**，$N=2$；第二次算出前三个数的**和**，$N=3$；以此类推。**算完后只需把总和除以 $N$**。
-- **v2 的优势：少了原来每一步的乘法和除法。**
-
-**针对 Causal Masking 的优化**：自回归训练时需要 Mask 作用在 Attention Score 矩阵上，保证每个 token 不会 attend 到它之后的 token。这个过程中 Attention Score **仍被完整计算**，即使接近一半的元素会被 mask 掉而不被使用。因为 v1 本身就是基于分块计算的，**如果某个分块需要被完全 mask，就可以直接跳过该分块、不做任何计算**。这个简单的方法可以加速 attention 计算 **1.7–1.8×**。
-
-#### 3.1.2 反向过程：合并两个保存量
-
-FA v1 在反向过程中用如下方式计算分块的 attention weight $P_{ij}$（参考原论文 Algorithm 4 第 13 行，为简洁忽略 mask）：
-
-```text
-(32)  P_{ij} = exp(S_{ij} − m_i) / ℓ_i
-```
-
-为了算出 (32)，需要保存**两个**变量：$m_i$ 与 $\ell_i$。FA v2 把二者合并为**一个**变量：
-
-```text
-(33)  P_{ij} = exp(S_{ij} − L_i)
-(34)  其中  L_i = log(ℓ_i) + m_i          （即 Log-Sum-Exp, LSE）
-```
-
-> **为什么能省**：$\ell_i$ 是 softmax 分母、$m_i$ 是行最大值，二者都是 $N$ 维向量。v1 反向要同时读 $m_i$ 与 $\ell_i$ 才能重建 $P_{ij}$；v2 只保存一个 LSE 向量 $L_i$，反向只需一次读取，**MAC 与显存都减半**。
-
-### 3.2 并行（Parallelism）
-
-先补 GPU 基本工作原理：
-
-- GPU 相对 CPU 的特点是**非常适合并行任务**，因为它含有大量计算单元。单个计算单元通常不如 CPU 强大，但大量计算单元可以**同时**完成并行任务；
-- GPU 依靠 **thread** 完成计算，thread 按 **thread block** 的形式组织管理；这些 thread block 最终被调度到 **streaming multiprocessors (SM)** 上计算；
-- 每个 thread block 中每 **32 个 thread 构成一个 warp**；同一个 warp 内的 thread 可以**协作完成矩阵乘法**；同一个 thread block 内的所有 warp 可以**共享存储空间**；
-- **SM 是 GPU 中真正的物理计算单元，A100 一共有 108 个 SM**。要提高计算吞吐量，就需要尽可能保证**每个时刻有较多的 SM 同时在参与计算**。
-
-#### 3.2.1 v1 的并行策略
-
-- v1 的并行**主要在 attention head 之间**：一次前向中，同一 self-attention block 中的 heads 可以并行计算；
-- 又因为同一 batch 中的数据也是并行处理的，所以 v1 **实际在 batch 与 attention head 两个维度同时并行**；
-- v1 **用一个 thread block 处理一个 attention head**。当总并行数（batch size × head 数）足够大时，同时参与计算的 SM 更多，整体吞吐量自然更高。
-- ⚠️ **问题**：随着 LLM 上下文窗口越来越长，**单卡上 batch size 通常变得非常小**，因此实际可并行的 attention head 数量可能**远远少于 SM 数量**，导致系统整体吞吐量较低。
-
-#### 3.2.2 v2 的并行策略
-
-要想解决上面的问题，就得思考**除了 batch 与 attention head，还能在哪些维度并行**。
-
-其实在介绍 v1 时已经提到过另一种并行策略：图 6、图 7 所示的**同一分块内每一行的计算之间没有任何信息交互**，多行一起算本来就只是一种并行策略。因此**当现有并行策略无法完全利用 SM 时，可以让更多行一起并行计算**（例如让图 6 中蓝色 block 与橙色 block 并行）——这种并行策略对应 v1 的**内循环**。
-
-**v2 交换了内、外循环的顺序**，但本质不变。所以 **v2 实际上是在 v1 的并行策略基础上，增加了外循环（行方向）的并行。** 反向过程类似，只有细微差异。
-
-### 3.3 计算分片（Work Partitioning）
-
-- 每个 thread block 负责某个分块的一个 attention head 的计算；
-- 每个 thread block 内，thread 又被组织为多个 **warp**，每个 warp 中的 thread 可以协同完成矩阵乘法；
-- **Work Partitioning 主要针对 warp 的组织优化**。
-
-**牢记：矩阵乘法本身是可分块计算的。** 因此可以充分利用多个 warp 的计算能力对矩阵做分块处理，加快整体计算。
-
-**v1 的做法**：thread block 中的 thread 分 **4 个 warp**，把 **$K$ 和 $V$ 划分为 4 个分块**与每个 warp 对应；**对 $Q$ 不进行分块**。设序列长度为 $N$、维度为 $d$（$d\le 128$），则 $K,V$ 按序列长度维度分片为 $K_1,K_2,K_3,K_4$ 和 $V_1,V_2,V_3,V_4$，大小都是 $(N/4,d)$。以 $K_1,V_1$ 为例：
-
-```text
-(35)  S₁ = Q K₁ᵀ        ∈ R^{N×(N/4)}
-(36)  P₁ = softmax(S₁)  ∈ R^{N×(N/4)}
-(37)  O₁ = P₁ V₁        ∈ R^{N×d}
-```
-
-由 (35)–(37) 可知，**每一分块计算出的输出 $O_1$ 与最终输出的尺寸一致**，因此需要把 $O_1,O_2,O_3,O_4$ **相加**才能得到最终输出 $O$。
-
-所以：
-1. 每个 warp 按照 (35)–(37) 根据自己的分块计算；
-2. 把结果写入**共享存储区域**；
-3. **同步（sync）完成后将结果相加**得到最终输出。
-
-> ⚠️ 代价：**warp 之间需要通信/同步，还要做额外的加法及其读写。**
-
-**v2 的做法**：**对 $Q$ 进行分块**，而不是对 $K,V$ 分块。把 $Q$ 分成 $Q_1,Q_2,Q_3,Q_4$，尺寸都是 $(N/4,d)$。以 $Q_1$ 为例：
-
-```text
-(38)  S₁ = Q₁ Kᵀ        ∈ R^{(N/4)×N}
-(39)  P₁ = softmax(S₁)  ∈ R^{(N/4)×N}
-(40)  O₁ = P₁ V         ∈ R^{(N/4)×d}
-```
-
-由 (38)–(40) 可知，**v2 的分块策略只需把每个分块的结果拼接（concat）就能得到最终结果**：
-
-- **warp 之间无需通信**；
-- **减少了额外的加法以及它对应的读写操作**；
-
-因此 v2 的分块策略更加高效。
-
-### 3.4 实验结果
-
-- FA v2 比 FA v1 快 **1.3–3×**；
-- FA v2 比标准 self-attention 快 **3–10×**；
-- 在 A100 上 FA v2 能达到 **230 TFLOPs/s，是 A100 极限的 73%**。
-
----
-
-## 4. Efficient Memory Attention（EMA）与 xformers
-
-这一节介绍另一种常用的 self-attention 加速算法 **EMA（Efficient Memory Attention）**。正如其名，EMA 原本主要为解决 self-attention 的**空间复杂度**问题而设计。attention 加速库 **xformers** 对 EMA 进一步做了速度优化，后来被大量 LLM 使用。
-
-### 4.1 EMA 中的存储优化
-
-把 self-attention 的计算公式改写为**向量形式**，关注某个特定 Query（如 $q_i$）：
-
-```text
-(41)  s_i = q_i Kᵀ         ∈ R^n
-(42)  p_i = softmax(s_i)   ∈ R^n
-(43)  o_i = p_i V          ∈ R^d          = Σⱼ p_{ij} v_j   （加权和）
-```
-
-- (43) 实际是一个**加权和**，权重由 (42) 的 softmax 计算得到；
-- 要计算 (43)，必须**保存 (42) 得到的所有权重**，因此空间复杂度为 $O(n)$（$n$ 为序列长度）；
-- 以上针对**某个特定 Query**；而 self-attention 通常同时处理所有 Query，所以**整体空间复杂度变为 $O(n^2)$**。
-
-把 (42) 代入 (43)，得到更完整的 $o_i$ 表达式：
-
-```text
-(44)  o_i = ( Σⱼ e^{s_{ij}} v_j ) / ( Σⱼ e^{s_{ij}} )          j = 1..n
-```
-
-**注意到 (44) 最后一个等式右项的分子、分母都是求和项，且都是从索引 1 求和到索引 $n$。** 于是有一种优化计算方法：**对分子和分母分别用一个临时变量保存前 $n$ 项的求和结果**；计算第 $n+1$ 项时，只需单独算出第 $n+1$ 项的值再加上之前的求和结果。
-
-例如，用两个变量分别保存分子、分母截至索引 $i$ 的求和结果：
-
-```text
-(45)  num_i = Σ_{j≤i} e^{s_ij} v_j
-(46)  den_i = Σ_{j≤i} e^{s_ij}
-```
-
-当需要算 $i+1$ 的分子分母时，只需做增量更新：
-
-```text
-(47)  num_{i+1} = num_i + e^{s_{i,i+1}} v_{i+1}
-(48)  den_{i+1} = den_i + e^{s_{i,i+1}}
-```
-
-当 $i=n$ 时，(47)(48) 就计算出了 (44) 中的分子与分母，所以 **(47) ÷ (48) 就得到正确的 $o_i$**。与 (41)–(43) 的写法不同，(47)(48) 在计算过程中**只需额外保存两个量，且与序列长度 $n$ 无关**，因此空间复杂度是 $O(1)$（针对单个 Query）。
-
-如果对所有 Query 也**按顺序执行**（而非标准 self-attention 的并行执行），那么整个 self-attention 的空间复杂度就是 $O(n)$。实际中通常还需要保存 $Q,K,V$ 的索引，因此索引开销（二进制索引）的复杂度是 $O(n\log n)$。
-
-> **EMA 把空间复杂度从 $O(n^2)$ 降到 $O(n)$，代价是计算时间的增加。**
-
-原论文实验中，当序列长度为 **16,384** 时：标准 self-attention 的存储开销是 **1 GB**，而 EMA 仅 **17 MB**；EMA 的耗时增加约 **10%–15%**。
-
-> **与 FlashAttention v2 的关系**：v2 的做法（公式 (30)(31)）其实和 EMA 类似——都是"先累加、最后再归一化"的在线计算思想。区别在于 FlashAttention 是在 SRAM 内分块完成并做了 IO 层面的优化，而 EMA 关注的是把中间权重矩阵彻底消掉。
-
-### 4.2 xformers
-
-- xformers 是一个 attention 加速库，其文档提到关键特性之一正是 Efficient Memory Attention；
-- ⚠️ **但 xformers 所谓的 Efficient Memory Attention 并不特指 4.1 节的 EMA 方法**，它指**一系列**对存储友好的 attention 变体方法，**包括 FlashAttention**；
-- 在 xformers 中使用 Efficient Memory Attention 时，它会**自动根据用户输入选择使用何种 attention 算子**；这些候选算子中，**FlashAttention 的优先级最高**。
-
----
-
-## 5. 基准测试代码索引
-
-文中介绍的所有方法官方都给出了基准测试代码，汇总如下（感兴趣的可以自行跑一下）：
-
-| 项目 | Benchmark 路径 / 链接 |
+| 符号 | 含义 |
 | --- | --- |
-| FlashAttention v1/v2 | `flash-attention/benchmarks/benchmark_flash_attention.py` |
-| xformers | `xformers/xformers/benchmarks/benchmark_mem_eff_attention.py` |
-| PyTorch SDPA | [Implementing High-Performance Transformers with Scaled Dot Product Attention (SDPA) — PyTorch Tutorials](https://pytorch.org/tutorials/intermediate/scaled_dot_product_attention_tutorial.html) |
+| $N$ | 序列长度 |
+| $d$ | 单头维度（head dimension），典型 64 / 128 |
+| $\mathbf{Q},\mathbf{K},\mathbf{V}\in\mathbb{R}^{N\times d}$ | query / key / value 矩阵 |
+| $\mathbf{S}=\mathbf{Q}\mathbf{K}^\top\in\mathbb{R}^{N\times N}$ | attention score 矩阵 |
+| $\mathbf{P}=\mathrm{softmax}(\mathbf{S})\in\mathbb{R}^{N\times N}$ | 逐行 softmax 后的权重矩阵 |
+| $\mathbf{O}=\mathbf{P}\mathbf{V}\in\mathbb{R}^{N\times d}$ | 输出 |
+| $B_r,B_c$ | 行分块大小、列分块大小 |
+| $T_r=\lceil N/B_r\rceil,\ T_c=\lceil N/B_c\rceil$ | 分块个数 |
+| $M$ | 片上 SRAM 容量（A100 每 SM 192 KB） |
+| HBM | High Bandwidth Memory，显存；A100 40–80 GB，1.5–2.0 TB/s |
+| SRAM | 片上共享内存；A100 每 SM 192 KB，约 19 TB/s |
+| IO | HBM 与 SRAM 之间的读写次数（本文的优化目标） |
 
-**PyTorch 2.2 中已经有了 self-attention 的高效实现（SDPA）**，上面链接中有相关介绍和 benchmark 代码。
-
-> 补充（来自原文评论区的高质量讨论）：SDPA 能走到 flash 后端（与 FA2 同速）的常见条件——dtype 为 fp16/bf16、较新 GPU（Ampere sm80+ / Hopper）、head_dim 受支持（≤256；Qwen3 文本头是 128）、mask 为 causal 或无 mask、**不要求返回注意力权重**、张量布局连续对齐。反过来会掉到 MATH 后端而明显变慢的情形：fp32 输入、要求输出注意力权重（`output_attentions=True`）、传入 flash 不支持的浮点加性 mask/bias、head_dim 超范围、老显卡或跑在 CPU 上。
+按论文惯例，为叙述清晰**省略 softmax 缩放因子** $1/\sqrt{d}$ 以及可选的 mask / dropout；它们不改变任何结论。
 
 ---
 
-## 6. 复习清单（自测）
+## 1. 问题的根源：算术强度与 IO
+
+### 1.1 标准注意力做了什么
+
+给定 HBM 中的 $\mathbf{Q},\mathbf{K},\mathbf{V}$，目标是算出 $\mathbf{O}$ 并写回 HBM：
+
+```text
+S = Q Kᵀ        ∈ R^{N×N}
+P = softmax(S)  ∈ R^{N×N}      (逐行)
+O = P V         ∈ R^{N×d}
+```
+
+标准实现（论文 Algorithm 0）分三步：
+
+```text
+1. 从 HBM 分块读 Q, K → 算 S = QKᵀ      → 把 S 写回 HBM
+2. 从 HBM 读 S        → 算 P = softmax(S) → 把 P 写回 HBM
+3. 从 HBM 读 P, V     → 算 O = PV        → 把 O 写回 HBM
+4. 返回 O
+```
+
+**关键问题**：$\mathbf{S}$ 和 $\mathbf{P}$ 都是 $N\times N$ 的稠密矩阵，必须**物化（materialize）到 HBM**。当 $N\gg d$ 时（论文给的例子：GPT-2 训练中 $N=1024,\ d=64$），这两个矩阵的显存占用是 $O(N^2)$ 的，而且要在 HBM 上来回搬运三次。
+
+更要命的是，实际耗时并不由 FLOPs 决定。原因在于 **arithmetic intensity（算术强度）**：每访问一字节内存所对应的算术运算次数。
+
+| 类型 | 判定依据 | 典型算子 |
+| --- | --- | --- |
+| **Compute-bound** | 耗时由算术运算量决定，访存时间占比很小 | 大 inner dimension 的矩阵乘法；channel 数很多的卷积 |
+| **Memory-bound** | 耗时由访存次数决定，计算时间占比很小 | 逐元素操作（激活、dropout）、归约操作（sum、softmax、batch norm、layer norm） |
+
+softmax 是**归约操作**，属于 memory-bound。把 $N\times N$ 的矩阵搬到 HBM 再搬回来做归约，绝大部分时间花在搬运上。
+
+> 论文在引言里点明了这件事的直接后果：大量近似注意力方法把注意力放在**降低 FLOPs** 上，但「FLOP 减少」跟「墙钟时间变快」并不相关，因为它们忽略了访存开销（IO）。这也解释了为什么很多线性复杂度的近似方法并没有带来实际的加速。
+
+### 1.2 为什么"少算"不等于"快"
+
+![GPU 存储层级与 FlashAttention 的取舍](../assets/figures/fig-memory-hierarchy.svg)
+
+论文给的硬件背景（A100）：
+
+```text
+HBM : 40–80 GB , 1.5–2.0 TB/s
+SRAM: 192 KB × 108 个 SM , ≈ 19 TB/s      ← 比 HBM 快一个数量级，但小好几个数量级
+```
+
+GPU 的执行模型是：一个 kernel 把输入从 HBM 读进寄存器和 SRAM，算完，把输出写回 HBM。于是：
+
+- **SRAM 快得多但装不下整个注意力矩阵**——$N\times N$ 在 $N=4096$ 时就是 16M 个元素；
+- **HBM 装得下但慢**——每一次多余的往返都是实打实的时间。
+
+所以真正的杠杆是：**让数据尽量在 SRAM 里被反复使用，减少 HBM 往返次数**。论文把这个原则叫做 **IO-aware**（IO 感知）。
+
+### 1.3 两条核心思路
+
+FlashAttention 要同时满足两件事，才能真正避免把注意力矩阵写进 HBM：
+
+1. **不做物化也能算 softmax 的归约**——因为 softmax 的分母依赖整行所有元素，看起来必须先看到整行才能归一化；
+2. **反向传播不需要保存那个大矩阵**。
+
+对应论文用的两个经典技术：
+
+- **Tiling（分块）**：把输入切成块、多次遍历输入块，**增量地**完成 softmax 归约；
+- **Recomputation（重算）**：前向只保存 softmax 的归一化统计量，反向在片上快速重算注意力矩阵——比重 HBM 读回来更快。论文把它看作 selective gradient checkpointing 的一种形式；区别在于传统 checkpointing 是拿速度换显存，而这里因为省下的 HBM 访问更多，**即使 FLOPs 增加了，反向仍然更快**。
+
+---
+
+## 2. 在线 softmax：把归一化拆到分块上
+
+这一节是 FlashAttention 的数学核心，也是最值得自己推一遍的地方。
+
+![分块 + 在线 softmax：注意力矩阵从不落 HBM](../assets/figures/fig-tiling-online-softmax.svg)
+
+### 2.1 数值稳定的 softmax
+
+对向量 $x\in\mathbb{R}^{B}$，为数值稳定，先减去该向量的最大值：
+
+```text
+m(x)   := max_i x_i
+f(x)   := [ e^{x_1-m(x)}  …  e^{x_B-m(x)} ]
+ℓ(x)   := Σ_i f(x)_i
+softmax(x) := f(x) / ℓ(x)
+```
+
+注意这里 $m(x)$ 的作用纯粹是**数值安全**：论文明确说明，分解 softmax 时用 scaling，而减去行内最大值是为了数值稳定。因为 softmax 对平移不变（$e^{x_i-c}$ 的比值与 $c$ 无关），减去任何常数都不改变结果，减最大值只是让指数项不会上溢。
+
+### 2.2 两个块的合并公式
+
+设 $x = \begin{bmatrix}x^{(1)} \\ x^{(2)}\end{bmatrix}\in\mathbb{R}^{2B}$，其中 $x^{(1)},x^{(2)}\in\mathbb{R}^{B}$。论文给出：
+
+```text
+m(x) = max( m(x⁽¹⁾), m(x⁽²⁾) )
+
+f(x) = [ e^{m(x⁽¹⁾)-m(x)} f(x⁽¹⁾) ,  e^{m(x⁽²⁾)-m(x)} f(x⁽²⁾) ]
+
+ℓ(x) = e^{m(x⁽¹⁾)-m(x)} ℓ(x⁽¹⁾) + e^{m(x⁽²⁾)-m(x)} ℓ(x⁽²⁾)
+
+softmax(x) = f(x) / ℓ(x)
+```
+
+这三个式子是整个算法的支点，值得逐项理解：
+
+- **$m$ 就是取最大值**，天经地义；
+- **$f$ 的重缩放**：$f(x^{(1)})$ 是用**它自己的**局部最大值 $m(x^{(1)})$ 算出来的指数项。要拼进全局的 $f(x)$，而全局用的是 $m(x)$，差值正好是 $m(x^{(1)})-m(x)$，所以乘一个 $e^{m(x^{(1)})-m(x)}$ 就能把尺度调过去；
+- **$\ell$ 同理**：局部求和项要乘上同一个重缩放因子。注意这里出现了**两件"额外的事"**——乘法（重缩放）和加法（合并块），它们在 GPU 上都是非 matmul 操作，这正是 FlashAttention-2 要减少的对象（见 4.1）。
+
+**结论**：只要沿途保留两个统计量 $m(x)$ 和 $\ell(x)$，softmax 就可以**一次一个块**地算出来。论文把这种聚合方式称为 algebraic aggregation。
+
+> **直觉**：softmax 之所以看起来不能分块，只因为分母是全局求和。但"全局求和"是可以**增量维护**的——先算局部和，遇到新块时把旧和按尺度差缩放一下再加进来。于是归一化被推迟到最后一步，中间过程全在片上。
+
+### 2.3 一个可以手算的验证
+
+抽象公式容易看着对、实际用错。下面用 4 个元素、两个块（$B_c=2$）、$d=2$ 走一遍，$V$ 取单位阵所以第一块输出就是 $\tilde{\mathbf P}^{(1)}$。
+
+```text
+S  = [ 1  2 | 3  4 ]          V = [ 1 0 ]
+                                  [ 0 1 ]
+                                  [ 1 0 ]
+                                  [ 0 1 ]
+```
+
+**精确解**：$\mathrm{softmax}([1,2,3,4]) = [0.0321,\ 0.0871,\ 0.2369,\ 0.6439]$，故
+
+```text
+O = P V = [ 0.2369, 0.6439 ]
+```
+
+**分块计算**：
+
+```text
+块 1:  S⁽¹⁾ = [1, 2]
+       m⁽¹⁾  = 2
+       ℓ⁽¹⁾  = e^{-1} + e^{0} = 0.36788 + 1 = 1.36788
+       Õ⁽¹⁾  = e^{S⁽¹⁾-m⁽¹⁾} V⁽¹⁾ = 0.36788·[1,0] + 1·[0,1] = [0.36788, 1]
+
+块 2:  S⁽²⁾ = [3, 4]
+       m⁽²⁾  = max(m⁽¹⁾, rowmax(S⁽²⁾)) = max(2, 4) = 4
+       ℓ⁽²⁾  = e^{m⁽¹⁾-m⁽²⁾} ℓ⁽¹⁾ + rowsum(e^{S⁽²⁾-m⁽²⁾})
+             = e^{-2}·1.36788 + (e^{-1} + e^{0})
+             = 0.18512 + 1.36788 = 1.55300
+       Õ⁽²⁾  = e^{m⁽¹⁾-m⁽²⁾} Õ⁽¹⁾ + e^{S⁽²⁾-m⁽²⁾} V⁽²⁾
+             = 0.13534·[0.36788, 1] + 0.36788·[1,0] + 1·[0,1]
+             = [0.04979, 0.13534] + [0.36788, 0] + [0, 1]
+             = [0.41767, 1.13534]
+
+收尾:  O = diag(ℓ⁽²⁾)⁻¹ Õ⁽²⁾ = [0.41767/1.55300, 1.13534/1.55300]
+                               = [0.26894, 0.73106]
+```
+
+对照精确值 $\mathbf{P}$ 的后两块：$0.2369+0.0321 = 0.2690$，$0.6439+0.0871 = 0.7310$ —— **完全吻合**（末位差异来自手算舍入）。
+
+这个例子里有两点值得留意：
+
+- 归一化（除以 $\ell^{(2)}$）被**推迟到最后一步**。这正是 FlashAttention-2 的做法；v1 会在每个块都除一次（见 4.1）；
+- 重缩放是对**已有的累加器**施加一个纯标量因子 $e^{m^{(1)}-m^{(2)}}$——它必须是逐行独立的，因为每一行的 max 不同。
+
+---
+
+## 3. FlashAttention v1
+
+### 3.1 算法
+
+**输入**：HBM 中的 $\mathbf{Q},\mathbf{K},\mathbf{V}\in\mathbb{R}^{N\times d}$，片上 SRAM 容量 $M$。
+
+**分块大小**（论文 Algorithm 1 line 1）：
+
+```text
+B_c = ⌈M / (4d)⌉
+B_r = min( ⌈M / (4d)⌉ , d )
+```
+
+**初始化**（line 2）：在 HBM 中置
+
+```text
+O = (0)_{N×d} ,  ℓ = (0)_N ,  m = (-∞)_N
+```
+
+**主循环**（line 3–13）：
+
+```text
+把 Q 沿行切成 T_r = ⌈N/B_r⌉ 块 Q_1…Q_{T_r}，每块 B_r × d
+把 K, V 沿行切成 T_c = ⌈N/B_c⌉ 块，每块 B_c × d
+ℓ, m 同样切成 T_r 个子向量，每块 B_r
+
+for i = 1 … T_r:                     # 外层遍历 Q 的分块
+    从 HBM 载入 Q_i 到 SRAM
+    for j = 1 … T_c:                 # 内层遍历 K, V 的分块
+        从 HBM 载入 K_j, V_j 到 SRAM
+        S_ij = Q_i K_jᵀ                    ∈ R^{B_r × B_c}      (line 9)
+        m̃_ij = rowmax(S_ij)                ∈ R^{B_r}            (line 10)
+        P̃_ij = exp(S_ij − m̃_ij)            ∈ R^{B_r × B_c}
+        ℓ̃_ij = rowsum(P̃_ij)               ∈ R^{B_r}
+
+        m_i^new = max(m_i, m̃_ij)                                 (line 11)
+        ℓ_i^new = e^{m_i − m_i^new} ℓ_i + e^{m̃_ij − m_i^new} ℓ̃_ij
+
+        O_i ← diag(ℓ_i^new)^{-1} (                                       (line 12)
+                 diag(ℓ_i) e^{m_i − m_i^new} O_i
+               + e^{m̃_ij − m_i^new} P̃_ij V_j )
+
+        ℓ_i ← ℓ_i^new ,  m_i ← m_i^new                            (line 13)
+返回 O
+```
+
+### 3.2 逐行理解
+
+**line 3–4：分块与对应关系。** $\mathbf{Q}$ 按行切（每块 $B_r$ 行），$\mathbf{K},\mathbf{V}$ 也按行切（每块 $B_c$ 行）。$\mathbf{K}$ 按行切意味着 $S_{ij}=\mathbf{Q}_i\mathbf{K}_j^\top$ 覆盖的是 score 矩阵的**第 $i$ 个行带、第 $j$ 个列块**。$\ell,m$ 与 $\mathbf{O}$ 一样按行切成 $T_r$ 份，因为它们是**逐行**统计量（每行的 max 与归一化因子各自独立）。
+
+**line 9–10：在当前块里做局部归约。** 注意这里**没有**用全局的 $m_i$，而是先算当前块的局部最大值 $m̃_{ij}$。这是分块能成立的前提——先局部归约，再合并。
+
+**line 11：两个统计量各自的更新方式不同。**
+
+- $m_i^{\text{new}}$ 是纯粹的取最大值；
+- $\ell_i^{\text{new}}$ 则**不仅加了新块的贡献，还把旧的 $\ell_i$ 按尺度差缩放了**。缩放因子 $e^{m_i-m_i^{\text{new}}}$ 就是第 2.2 节那个 $e^{m(x^{(1)})-m(x)}$：旧的 $\ell_i$ 是用旧的（更小的）最大值算出来的，换成新的最大值要乘这个因子。
+
+**line 12：把输出也一起重缩放。** 这是最容易看漏的一行。三个要点：
+
+1. $\mathrm{diag}(\ell_i)e^{m_i-m_i^{\text{new}}}\mathbf{O}_i$ 是**对已有累加器的修正**——旧输出是用旧的归一化尺度攒起来的，现在尺度变了，必须按 $\ell_i e^{m_i-m_i^{\text{new}}}$ 缩放；
+2. $e^{m̃_{ij}-m_i^{\text{new}}}\tilde{\mathbf{P}}_{ij}\mathbf{V}_j$ 是**当前块的新贡献**，同样按新尺度归一；
+3. 最外层的 $\mathrm{diag}(\ell_i^{\text{new}})^{-1}$ 是**除以新的归一化因子**完成归一化。
+
+**line 11 与 line 12 的顺序很关键**：line 12 用到了**旧的** $\ell_i$ 和**旧的** $m_i$（因为旧累加器需要按旧尺度折算），所以 line 13 的更新必须放在 line 12 之后。这就是为什么 $m_i^{\text{new}},\ell_i^{\text{new}}$ 要先用新名字暂存、不能就地覆盖。
+
+**关于 $B_r,B_c$ 的选择**：line 1 的 $M/(4d)$ 里那个 4 对应的是片上需要同时容纳的四块数据（$\mathbf{Q}_i$、$\mathbf{K}_j$、$\mathbf{V}_j$、$\mathbf{O}_i$，尺寸都是 $B\times d$）。$B_r$ 额外被 $\min(\cdot,d)$ 截断，保证行分块不超过维度。$\ell,m$ 的尺寸是 $O(N)$，相对可忽略。
+
+### 3.3 IO 复杂度
+
+这是论文的核心理论结果。前向传播的 HBM 访问次数：
+
+```text
+FlashAttention:      Θ( N² d² M⁻¹ )
+标准注意力:          Ω( N d + N² )
+```
+
+其中 $d$ 是 head dimension，$M$ 是 SRAM 大小。论文同时证明了**下界**：不存在精确注意力算法能在所有 SRAM 大小下渐进地改进 HBM 访问次数——也就是 FlashAttention 在 IO 意义下是**最优**的。
+
+对比一下量级就能看出为什么这个替换值得：
+
+- 标准注意力的主导项是 $N^2$——**与 $d$ 无关，与 $M$ 无关**；
+- FlashAttention 的主导项是 $N^2d^2/M$——多了一个 $d^2/M$ 的因子。
+
+因为 $M$（192 KB）远大于 $d^2$（比如 $d=64$ 时 $d^2=4096$ 个元素），这个因子实际上远小于 1。论文给出的实测是**最多减少 9×** 的 HBM 访问（Fig. 2）。这也解释了为什么 $d$ 很大时 FlashAttention 的优势会缩水——$d^2/M$ 在变大。
+
+> **注意**：FlashAttention 的**时间复杂度**仍是 $O(N^2d)$（甚至因为重算略高），它优化的是 **IO 次数**。二者是不同维度的事：前者管"算多少"，后者管"搬多少"。在 memory-bound 的场景里，后者才是墙钟时间的主导项。
+
+### 3.4 反向传播
+
+反向需要 $\mathbf{S},\mathbf{P}$ 来算 $\mathbf{Q},\mathbf{K},\mathbf{V}$ 的梯度。标准实现把它们保存在 HBM 里（$O(N^2)$）。FlashAttention 的做法是**不保存，而是重算**：前向只留下输出 $\mathbf{O}$ 和 softmax 统计量 $(m,\ell)$，反向时当 $\mathbf{Q},\mathbf{K},\mathbf{V}$ 的分块已经在 SRAM 里，就地重算所需的 $S_{ij}$ 与 $P_{ij}$。
+
+具体地，反向过程中重算 attention weight 用的是前向保存的 $(m_i,\ell_i)$：
+
+```text
+P_ij = exp(S_ij − m_i) / ℓ_i
+```
+
+代价是额外的 FLOPs，收益是：
+
+- 显存从 $O(N^2)$ 降到**线性于序列长度**（具体地：只存 $O(N)$ 的统计量，而不再是 $N\times N$ 的矩阵）；
+- 因为省下的 HBM 读回更多，**即使 FLOPs 增加，反向仍然更快**。
+
+此外论文还用到两个省显存的技巧：保存输出 $\mathbf{O}$ 与统计量 $(m,\ell)$ 来重算 $\mathbf{S},\mathbf{P}$；以及保存前向 dropout 的**随机数生成器状态**、在反向重新生成 mask，从而不必存储整个 dropout mask。
+
+### 3.5 Block-Sparse FlashAttention（近似变体）
+
+论文把 FlashAttention 作为**基本组件**扩展到了块稀疏注意力：把注意力矩阵按块划分，只对部分块做计算，其余块直接跳过（对应被 mask 掉的区域），于是：
+
+- IO 复杂度比 FlashAttention 改善**一个正比于稀疏率（sparsity ratio）的因子**；
+- 实测比 FlashAttention 本身还快 **2–4×**，序列长度可扩展到 **64K**；
+- 论文声称它比当时已知的所有近似注意力方法都快。
+
+> ⚠️ **这是全文唯一的近似部分**。其余（v1 前向、反向，v2 全部改进）都是**精确**的——输出与标准注意力一致，没有任何质量损失。
+
+### 3.6 实验结论
+
+- **注意力算子层面**：相对 PyTorch 实现，在 GPT-2 上最高 **7.6×** 加速（因为完全不需要读写 $N\times N$ 矩阵）；在 128–2K 的常见序列长度上最高 3× 加速，并可扩展到 64K；
+- **端到端训练**：BERT-large（seq 512）比 MLPerf 1.1 的训练速度记录快 **15%**；GPT-2（seq 1K）比 HuggingFace / Megatron-LM 基线快 **3×**；Long-Range Arena（seq 1K–4K）快 **2.4×**；
+- **模型质量**：GPT-2 perplexity 改善 **0.7**；长文档分类提升 **6.4** 个点；首次让 Transformer 在 **Path-X**（seq 16K，61.4% 准确率）和 **Path-256**（seq 64K，63.1%）上取得优于随机的表现——而**仅仅是因为用上了更长的序列**。
+- **显存**：反向省下 **10–20×**（取决于序列长度）。
+
+---
+
+## 4. FlashAttention-2
+
+### 4.1 动机：非 matmul FLOPs 贵 16 倍
+
+v1 已经比优化过的基线快 2–4×，但**远没有达到 GEMM 的效率**：前向只到理论峰值的 **30–50%**，反向更低，只有 **25–35%**（A100）。而优化良好的 GEMM 能到 80–90%。
+
+论文通过 profiling 定位到原因：**thread block 之间、warp 之间的工作划分不优**，导致要么占用率（occupancy）低，要么产生多余的 shared memory 读写。
+
+**这里有个重要的先验知识**：现代 GPU 有专门加速矩阵乘的单元（Tensor Core）。论文给出的 A100 数字是：
+
+```text
+FP16/BF16 matmul      : 312 TFLOPs/s   ← 理论峰值
+非 matmul 的 FP32 运算 :  19.5 TFLOPs/s
+比值                   : 312 / 19.5 = 16
+```
+
+也就是说，**一个非 matmul FLOP 的开销相当于 16 个 matmul FLOP**。虽然非 matmul 操作的 FLOPs 数量占比很小，但它们**耗时更长**。所以要维持高吞吐（比如峰值 50% 以上），必须把时间尽量花在 matmul 上，尽量砍掉非 matmul 操作。
+
+基于这个认识，FA2 做了三件事（论文引言的编号）：
+
+1. **改算法，减少非 matmul FLOPs**（4.2）；
+2. **把并行的维度从 batch × head 扩展到序列长度方向**，即使单个 head 也能并行，以提高占用率（4.3）；
+3. **在 thread block 内部按 warp 重新划分工作**，减少 shared memory 通信与读写（4.4）。
+
+结果：相对 FlashAttention 约 **2×** 加速，A100 上前向达到理论峰值的 **50–73%**、反向 **63%**；端到端训练 GPT 类模型时达到 **225 TFLOPs/s per A100**（模型 FLOPs 利用率 72%）。
+
+### 4.2 算法层面的两个改动
+
+FA2 对在线 softmax 做了两处微调，都不改变输出。
+
+**改动一：不要每步都重缩放输出。**
+
+v1 的 line 12 在两个地方除以了 $\ell$：
+
+```text
+Õ⁽²⁾ = diag(ℓ⁽¹⁾/ℓ⁽²⁾)⁻¹ Õ⁽¹⁾  +  diag(ℓ⁽²⁾)⁻¹ e^{S⁽²⁾−m⁽²⁾} V⁽²⁾
+        └──── 对旧累加器的重缩放 ────┘   └──── 对新块的归一化 ────┘
+```
+
+论文观察到：**没必要让两项都乘 $\mathrm{diag}(\ell^{(2)})^{-1}$**。可以直接维护一个**未归一化**的累加器 $\tilde{\mathbf{O}}^{(2)}$，把统计量 $\ell^{(2)}$ 留着，**只在循环结束时除一次**：
+
+```text
+Õ⁽²⁾ = diag(e^{m⁽¹⁾−m⁽²⁾})⁻¹ Õ⁽¹⁾  +  e^{S⁽²⁾−m⁽²⁾} V⁽²⁾
+       = e^{s⁽¹⁾−m} V⁽¹⁾ + e^{s⁽²⁾−m} V⁽²⁾
+
+O⁽²⁾ = diag(ℓ⁽²⁾)⁻¹ Õ⁽²⁾ = O          ← 循环结束后才归一化
+```
+
+这就是第 2.3 节手算例子里的做法。省下的是**每次迭代的除法**（以及 v1 中为配合它而做的 $\ell$ 更新里的乘法）。
+
+> 可以这样记：v1 每一步都在维护"精确的滚动平均"，v2 改成"滚动求和、最后一次再除"。求和比求平均少一次除法，而除法在 GPU 上是慢操作。
+
+**改动二：反向只保存 logsumexp。**
+
+v1 反向需要 $(m^{(j)}, \ell^{(j)})$ **两个**向量。FA2 指出只需要保存一个：
+
+```text
+L⁽ʲ⁾ = m⁽ʲ⁾ + log( ℓ⁽ʲ⁾ )
+```
+
+于是反向重算权重变成（对比 3.4 的 v1 形式）：
+
+```text
+v1 :  P_ij = exp(S_ij − m_i) / ℓ_i
+FA2:  P_ij = exp(S_ij − L_i)
+```
+
+**为什么能省**：由定义 $\exp(S_{ij}-L_i)=\exp(S_{ij}-m_i-\log\ell_i)=\exp(S_{ij}-m_i)/\ell_i$，两者数学上完全等价；但从存储和读取角度，v1 要保存并读回两个 $N$ 维向量，FA2 只用一个，**读取次数和显存占用都减半**。$L_i$ 就是 logsumexp。
+
+顺带一提：FA2 反向的算法结构与 v1 相同（仍受益于 tiling 与重算），改变的是保存什么、怎么重算。论文也提到反向的**概念**比前向简单（没有 softmax 重缩放），但**实现**更复杂——因为反向要保持 5 个矩阵乘法在 SRAM 里，而前向只要 2 个。
+
+### 4.3 并行策略
+
+**GPU 执行模型的必要背景**（论文 §2.1）：
+
+```text
+threads  →  组织成 thread block  →  调度到 SM (streaming multiprocessor) 上运行
+            每个 block 内，32 个 thread 组成一个 warp
+            warp 内的 thread 可用 shuffle 指令通信，或协作做矩阵乘
+            warp 之间通过 shared memory 通信
+            A100 有 108 个 SM
+```
+
+**v1 的并行策略**：分布在 **batch × attention head** 两个维度上，**一个 thread block 处理一个 attention head**。当 $(\text{batch}\times\text{head})$ 足够大时，108 个 SM 都能被喂饱，吞吐量就高。
+
+**v1 的致命问题**：序列变长以后，单卡上的 **batch size 通常变得很小**。此时可并行的 head 数远少于 SM 数量，大量 SM 闲置，吞吐量塌下来。这个问题在长上下文场景（正是最需要 FlashAttention 的场景）里格外严重。
+
+**v2 的解法**：既然 batch×head 不够用，就到**序列长度方向**去找并行度。而这里正好有现成的：
+
+- 回到在线 softmax，**注意力矩阵的每一行是独立归约的**——第 $i$ 行的输出 $\mathbf{O}_i$ 只依赖 $\mathbf{Q}_i$ 与全部 $\mathbf{K},\mathbf{V}$，与其它行毫无交互；
+- 所以可以让不同的 thread block 分别处理**不同的行分块**（即不同的 $i$），彼此不需要通信。
+
+于是 FA2 让**外层循环（遍历 $\mathbf{Q}$ 的分块）也参与并行**：并行维度变成 **batch × head × 序列行分块**。这直接提高了占用率，尤其在小 batch 的长序列场景下效果显著。
+
+> 注意这里"行之间无交互"的性质其实是 **tiling 本身**提供的：分块计算之所以可行，就是因为行的归约是独立的、列方向的归约被在线 softmax 处理掉了。
+
+### 4.4 Work Partitioning（warp 级的工作划分）
+
+并行解决了 block 之间的调度问题，但**block 内部**多个 warp 怎么分工同样影响性能——因为 warp 之间只能通过 shared memory 通信，多绕一趟就多一次读写。
+
+![Work Partitioning：切哪个矩阵，决定了要不要同步](../assets/figures/fig-work-partitioning.svg)
+
+**v1 的做法**：把一个 thread block 里的 thread 分成 **4 个 warp**，把 $\mathbf{K}$ 和 $\mathbf{V}$ 按序列长度维度各切成 **4 块**，每个 warp 分一块；**$\mathbf{Q}$ 不切**。以 $K_1,V_1$ 为例：
+
+```text
+S₁ = Q K₁ᵀ        ∈ R^{N × (N/4)}
+P₁ = softmax(S₁)  ∈ R^{N × (N/4)}
+O₁ = P₁ V₁        ∈ R^{N × d}
+```
+
+关键在于：**每个分块算出的 $\mathbf{O}_1$ 尺寸与最终输出 $\mathbf{O}$ 一致**（都是 $N\times d$），但它们只是**部分和**。所以必须：
+
+1. 每个 warp 各算一个部分输出；
+2. 写入共享存储区；
+3. **同步（sync）之后把 4 个部分结果相加**。
+
+代价：warp 间需要通信与同步，还有额外的加法及其对应的 shared memory 读写——而同步和加法都是非 matmul 开销。
+
+**v2 的做法**：反过来，**切 $\mathbf{Q}$ 而不切 $\mathbf{K},\mathbf{V}$**。把 $\mathbf{Q}$ 按行切成 4 块，每个 warp 拿一块：
+
+```text
+S₁ = Q₁ Kᵀ        ∈ R^{(N/4) × N}
+P₁ = softmax(S₁)  ∈ R^{(N/4) × N}
+O₁ = P₁ V         ∈ R^{(N/4) × d}
+```
+
+这时每个分块的输出 $\mathbf{O}_1$ 是最终输出的**一个行带**，彼此不重叠、没有求和关系：
+
+- **warp 之间不需要通信、不需要同步**；
+- **不需要额外的加法和相应的读写**；
+- 每个 warp 的结果**直接拼接（concat）**就是最终输出。
+
+这就是 FA2 的 work partitioning 比 v1 高效的原因：它把"部分和 + 归约"变成了"独立片段 + 拼接"。
+
+> 两处改动合起来看，FA2 的主线非常一致：**凡是能在 matmul 之外省掉的（除法、同步、加法、多余的读写），就省掉**。这也解释了为什么它相对 v1 只快了约 2×，而相对标准实现能快 3–10×。
+
+### 4.5 结果
+
+| 指标 | FlashAttention v1 | FlashAttention-2 |
+| --- | --- | --- |
+| 前向吞吐（% 理论峰值，A100） | 30–50% | **50–73%** |
+| 反向吞吐 | 25–35% | **63%** |
+| 相对 v1 | 1× | **≈2×**（论文亦称 2–3×） |
+| 端到端训练 | — | **225 TFLOPs/s per A100**（72% MFU） |
+| 相对标准注意力 | 2–4× | **3–10×** |
+| 反向保存的统计量 | $(m,\ell)$ 两个向量 | $L=\mathrm{logsumexp}$ 一个向量 |
+
+---
+
+## 5. 另一种思路：EMA
+
+FlashAttention 与 EMA 常被并列提起，但它们**出发点不同**，值得分清。
+
+### 5.1 问题：权重必须被保存
+
+对单个 query $q$，注意力是
+
+```text
+s_i = ⟨q, k_i⟩ ,   o = ( Σ_i v_i e^{s_i} ) / ( Σ_j e^{s_j} )
+```
+
+标准实现要先算出并**保存整行权重** $s'_i=e^{s_i}$（每个 query 需要 $O(n)$ 时间与空间），而自注意力要处理所有 query，于是整体时间和空间都是 $O(n^2)$。
+
+### 5.2 增量算法
+
+关键观察：分子、分母都是**对 $i$ 从 1 累加到 $n$ 的求和项**，所以可以增量维护。状态只有两项——一个 $d$ 维向量 $v^\*$ 和一个标量 $s^\*$，都初始化为 0：
+
+```text
+每个 (k_i, v_i)：
+    s_i = ⟨q, k_i⟩
+    v* ← v* + v_i · e^{s_i}
+    s* ← s* + e^{s_i}
+
+全部处理完后：  o = v* / s*
+```
+
+自注意力就是对每个 query 顺序执行同一过程。**对单个 query，额外空间是 $O(1)$（与序列长度无关）**——这就是标题"不需要 $O(n^2)$ 内存"的由来。
+
+### 5.3 数值稳定性：必须维护 running max
+
+论文指出一个很实际的问题：**score 超过 89 就会在 float32 / bfloat16 里上溢成 inf**。所以和 FlashAttention 一样，要额外维护一个运行最大值 $m^\*$（初始化为 $-\infty$），两个累加器都要重缩放：
+
+```text
+每个 (k_i, v_i)：
+    m_i = max(m*, s_i)
+    v* ← v* · e^{m* − m_i} + v_i · e^{s_i − m_i}
+    s* ← s* · e^{m* − m_i} + e^{s_i − m_i}
+    m* ← m_i
+
+最后：  o = v* / s*
+```
+
+对比一下就能看出这和 FlashAttention 的在线 softmax 是**同一套数学**：$e^{m^\* - m_i}$ 就是那个"把旧累加器按新的最大值重新缩放"的因子。论文也说明他们的方法是**精确的**（不是近似），并明确处理了数值稳定性问题。
+
+> 实现细节：在 JAX 代码里，每个分块的最大值还会额外经过 `jax.lax.stop_gradient`，避免最大值这一项参与梯度（它本身是 max 操作，梯度没有意义）。
+
+### 5.4 分块实现与 $O(\sqrt n)$
+
+纯顺序累加虽然省内存，但硬件利用率差。论文的实际实现用**两层循环**做分块：
+
+```text
+外层：遍历 query 的分块（query_chunk_size 默认 1024，迭代次数线性）
+内层：顺序遍历 key/value 的分块（key_chunk_size 默认 4096，与 num_kv 取 min）
+      每个 (query 块, kv 块) 产出一个"局部摘要"：
+          exp_weights = exp(S_chunk − max_score)      ← 局部最大值
+          exp_values  = exp_weights @ V_chunk
+          return (exp_values, rowsum(exp_weights), max_score)
+合并：取所有分块最大值的全局 max → 各分块按 e^{chunk_max − global_max} 重缩放
+      → 分别求和 → 最后 all_values / all_weights
+```
+
+**内存复杂度的层次**（这是最容易被误传的一点，论文给了三个不同的说法）：
+
+| 范围 | 额外内存 |
+| --- | --- |
+| 单个 query，纯顺序 | $O(1)$ |
+| 整个自注意力，纯顺序 | $O(\log n)$ —— 额外要存一个指向序列/query 列表的索引 |
+| 实际分块实现（query 块固定、kv 块取 $\sqrt n$） | $O(\sqrt n)$ |
+
+其中 $O(\log n)$ 的来源很具体：如果输入顺序和计算顺序不一致，就得额外保存一个**索引**，索引本身占 $O(\log n)$。理论最优是"query 块取常数、key/value 块取 $\sqrt n$"，于是得到 $\sqrt n$ 个摘要，对应 $O(\sqrt n)$ 内存。两个 chunk size 都作为参数暴露出来。
+
+**时间复杂度不变**：单 query $O(n)$，整体 $O(n^2)$。也就是说 EMA 是**拿时间换空间**，而不是降低复杂度。
+
+> 反向传播上，论文对分块摘要函数施加了 `jax.checkpoint`：前向不保留分块中间结果，反向重算——和 FlashAttention 的重算思路一致。
+
+### 5.5 实测效果
+
+在单块 TPUv3、单 attention head、输入 bfloat16 上（"内存开销"指超出输入/输出张量之外的峰值显存，OOM 表示超过 16 GB）：
+
+**推理**
+
+| 序列长度 $n$ | $2^{10}$ | $2^{12}$ | $2^{14}$ | $2^{16}$ | $2^{18}$ | $2^{20}$ |
+| --- | --- | --- | --- | --- | --- | --- |
+| 输入/输出 | 640 KB | 2.5 MB | 10 MB | 40 MB | 160 MB | 640 MB |
+| 标准注意力开销 | 4.0 MB | 64 MB | **1 GB** | OOM | OOM | OOM |
+| EMA 开销 | 4.0 MB | 16 MB | **17 MB** | 21 MB | 64 MB | 256 MB |
+| 相对计算速度 | ±5% | −8% | **−13%** | — | — | — |
+
+**求导（反向）**
+
+| 序列长度 $n$ | $2^{10}$ | $2^{12}$ | $2^{14}$ | $2^{16}$ | $2^{18}$ | $2^{20}$ |
+| --- | --- | --- | --- | --- | --- | --- |
+| 标准注意力开销 | 8.0 MB | 128 MB | **2.0 GB** | OOM | OOM | OOM |
+| EMA 开销 | 8.0 MB | 41 MB | **64 MB** | 257 MB | 1.0 GB | 4.0 GB |
+| 相对计算速度 | ±5% | −30% | **−35%** | — | — | — |
+
+要点：
+
+- $n = 2^{14} = 16384$ 时，**推理内存从 1 GB 降到 17 MB（约 59×），求导内存从 2.0 GB 降到 64 MB（32×）**——与论文摘要给出的 59×/32× 一致；
+- 代价是**计算变慢**：推理约 −13%，求导约 −30% ~ −35%；
+- 标准注意力在 $2^{16}$ 就 OOM，而 EMA 能扩展到 $n=2^{20}$（约 100 万），论文声称至少可扩展到 $2^{20}$；
+- 两种实现输出的最大绝对差为 $1.8\times10^{-7}$（$n=2^{14}$，标准正态输入），即**数值上等价**。
+
+### 5.6 与 FlashAttention 的关系
+
+| | EMA | FlashAttention |
+| --- | --- | --- |
+| 首要目标 | 降低**显存占用** | 降低 **HBM 访问（IO）** |
+| 手段 | 增量累加 + 分块摘要，彻底消掉权重矩阵 | tiling + 在线 softmax + 重算 |
+| 时间代价 | 增加（推理 ~13%，反向 30–35%） | **不增加**，反而显著加速 |
+| 共同点 | 都维护运行统计量、最后统一归一化、反向都重算 | 同左 |
+
+一句话：**两者共享同一套在线 softmax 数学，但优化目标不同**——EMA 用时间换显存，FlashAttention 用重算换 IO，且后者在 GPU 上同时拿到了速度和显存两个好处。
+
+工程上还有个容易混淆的点：**xformers 里的 "Efficient Memory Attention" 并不特指 EMA**，而是指一系列对显存友好的注意力变体，**FlashAttention 也在其中，且优先级最高**；xformers 会根据输入自动选择实际算子。
+
+---
+
+## 6. 什么时候该用 FlashAttention
+
+理解一个技术"什么时候不管用"和"什么时候管用"同样重要。
+
+### 6.1 它优化的是什么
+
+| | 标准注意力 | FlashAttention |
+| --- | --- | --- |
+| 时间复杂度（FLOPs） | $O(N^2 d)$ | $O(N^2 d)$（重算使其略高） |
+| 空间复杂度 | $O(N^2)$ | $O(N)$（不物化 $\mathbf{S},\mathbf{P}$） |
+| HBM 访问次数 | $\Omega(Nd + N^2)$ | $\Theta(N^2 d^2 M^{-1})$ |
+| 输出精度 | 基准 | **完全一致**（非近似） |
+
+一句话：**它不改时间复杂度，改的是访存**。所以它有效的前提是"这个算子确实被访存卡住"——而 softmax 这种归约操作正是如此。
+
+### 6.2 优势会缩水的场景
+
+- **$d$ 很大**：IO 优势因子是 $d^2/M$，$d$ 越大优势越小。这也是为什么工程实现里 head_dim 通常有上限（常见 ≈256）。
+- **序列很短**：$N$ 小的时候 $N^2$ 本身不大，tiling 的固定开销（以及被截断的 $B_r$）占比上升，收益有限。
+- **算力本身不是瓶颈的场景**（比如小模型 + 大 batch）：此时标准实现可能也已经吃满带宽。
+
+### 6.3 实践提示
+
+- 用 PyTorch 时通常不用手写，`F.scaled_dot_product_attention` 会根据条件自动选后端；能走到 flash 后端时性能与 FA2 相当。
+- 触发 flash 后端的常见条件：dtype 为 fp16/bf16（而非 fp32）、较新的 GPU（Ampere sm80+ / Hopper）、head_dim 在支持范围内、mask 是 causal 或无 mask、**不要求返回注意力权重**、张量布局连续对齐。
+- 会让它**掉回数学实现**从而明显变慢的情形：fp32 输入、要求输出注意力权重（`output_attentions=True`）、传入 flash 不支持的浮点加性 mask/bias、head_dim 超范围、老显卡或 CPU。
+- 原因和前文一致：要求"返回注意力权重"等于强制**物化** $N\times N$ 矩阵——正是 FlashAttention 要避免的事。
+
+---
+
+## 附录 A. 一张纸速查
+
+```text
+【核心问题】
+  S = QKᵀ, P = softmax(S), O = PV
+  S、P 是 N×N，标准实现要物化到 HBM（O(N²) 显存 + 三次 HBM 往返）
+  softmax 是 memory-bound，耗时由访存而非 FLOPs 决定
+
+【核心技巧】
+  1. tiling       : 分块，让数据在 SRAM 里被复用
+  2. online softmax: 增量维护 (m, ℓ)，把归一化推迟到最后
+  3. recomputation : 反向不存 S、P，用 (m,ℓ) 或 L 就地重算
+  4. kernel fusion : 整个注意力融成一个 CUDA kernel
+
+【在线 softmax 合并公式】
+  m(x) = max(m(x⁽¹⁾), m(x⁽²⁾))
+  ℓ(x) = e^{m(x⁽¹⁾)−m(x)} ℓ(x⁽¹⁾) + e^{m(x⁽²⁾)−m(x)} ℓ(x⁽²⁾)
+  缩放因子 e^{m_local − m_global} 是全部推导的关键
+
+【复杂度】
+  HBM 访问:  Θ(N²d²/M)   vs 标准 Ω(Nd + N²)     最多省 9×
+  显存     :  O(N)       vs 标准 O(N²)          省 10–20×
+  FLOPs    :  仍 O(N²d)（重算略增）
+
+【数字】
+  A100: HBM 40–80GB @1.5–2.0TB/s ; SRAM 192KB/SM ×108 @≈19TB/s
+  matmul 312 TFLOPs/s vs 非 matmul 19.5 TFLOPs/s  → 非 matmul 贵 16×
+  v1 前向 30–50% 峰值，反向 25–35%
+  v2 前向 50–73% 峰值，反向 63%，端到端 225 TFLOPs/s (72% MFU)
+  相对标准注意力: v1 2–4×，v2 3–10×；v2 比 v1 快约 2×
+
+【v1 → v2 三处改进】
+  1. Algorithm  : 不每步重缩放输出（最后统一除）；反向只存 L = m + log ℓ
+  2. Parallelism: 并行维度 batch×head → batch×head×行分块（提高占用率）
+  3. Partition  : warp 切分 K,V（v1，需同步+求和）→ 切 Q（v2，直接拼接）
+
+【EMA（Rabe & Staats, arXiv:2112.05682）】
+  目标相反：省显存，代价是变慢（推理 ~13%，反向 30–35%）
+  增量状态：v* ∈ R^d 与 s* ∈ R（+ running max m*）
+    v* ← v*·e^{m*−m_i} + v_i·e^{s_i−m_i} ;  s* ← s*·e^{m*−m_i} + e^{s_i−m_i}
+  内存：单 query 纯顺序 O(1)；整体 O(log n)；实际分块实现 O(√n)
+  时间不变：O(n) / O(n²)
+  n=16384 时：推理 1GB→17MB（59×），求导 2GB→64MB（32×）
+```
+
+---
+
+## 附录 B. 自测题
 
 **概念层**
 
-1. 为什么"降低 FLOPs"未必带来"降低耗时"？MAC 在什么条件下成为主瓶颈？
-2. Compute-bound 与 Memory-bound 各举三个例子；softmax 属于哪一类？
-3. HBM 与 SRAM 在容量、带宽上的取舍是什么？FlashAttention 用哪一层做计算、哪一层做存储？
-4. 标准 Transformer 的 8 次 HBM 读写分别是什么？
+1. 为什么"减少 FLOPs"不必然带来墙钟加速？什么量决定了 memory-bound 算子的耗时？
+2. 用算术强度解释：为什么 softmax 是 memory-bound，而大 inner dimension 的矩阵乘是 compute-bound？
+3. A100 上 matmul 与非 matmul 的理论吞吐差多少倍？这个比例对算法设计有什么直接指导？
+4. HBM 与 SRAM 在容量和带宽上各差几个数量级？FlashAttention 用哪一层计算、哪一层存储？
 
 **推导层**
 
-5. 为什么稳定版 softmax 能同时解决上溢和下溢？
-6. 把向量一分为二时，(12) 得到的 softmax 为什么是"局部的"？两个原因分别是什么？
-7. 写出把局部 EXP 求和项更新为全局项的通用乘子，并解释它的物理含义。
-8. 公式 (24) 中的更新为什么不需要 $x^{(1)},x^{(2)}$ 的原始向量值？
-9. v2 为什么可以不在每一步除以 EXP 求和项？用"1 到 10 求平均"的类比复述。
-10. v2 反向把 $m_i$ 与 $\ell_i$ 合并为 $L_i=\log\ell_i+m_i$，省下的是什么（显存？MAC？两者？）？
+5. 写出把两个块的 softmax 合并成一个的 $(m,\ell,f)$ 公式，并解释每个重缩放因子的来源。
+6. 为什么 $\ell$ 的更新里要**乘**一个 $e^{m^{\text{old}}-m^{\text{new}}}$，而不是直接相加？
+7. v1 的 line 12 为什么必须用**旧的** $\ell_i$ 和 $m_i$？为什么 line 13 必须放在 line 12 之后？
+8. 自己取一个 4 元素向量，手算一遍分块在线 softmax，并验证与精确 softmax 一致。
+9. FA2 为什么可以不在每次迭代里除以 $\ell$？用一个"滚动求和 vs 滚动平均"的类比解释。
+10. 证明 $\exp(S_{ij}-L_i)$ 与 $\exp(S_{ij}-m_i)/\ell_i$ 等价，并说明 FA2 这样改省下了什么。
+11. $B_c=\lceil M/(4d)\rceil$ 里的 4 对应哪四块数据？
 
 **工程层**
 
-11. $B_r,B_c$ 如何选？约束来自哪里？
-12. v1 的并行维度有哪些？长上下文为什么让它失效？
-13. v2 增加了哪个维度的并行？为什么交换内外循环就能增加并行度？
-14. v1 的 Work Partitioning 为什么需要 warp 间同步与额外加法？v2 为什么不需要？
-15. Block-Sparse FlashAttention 与 EMA 分别是"精确"还是"近似"？各自降低的是 MAC 还是 Memory？
+12. v1 的并行策略在长上下文场景为什么会失效？v2 增加了哪个维度的并行、为什么这个维度可以并行？
+13. v1 用 $K,V$ 做 warp 切分，为什么需要同步和额外加法？v2 改成切 $Q$ 后为什么不需要？
+14. Block-Sparse FlashAttention 与 EMA 分别降低的是什么（HBM 访问还是显存占用）？哪个是近似算法、哪个是精确算法？
+15. 为什么"要求返回注意力权重"会让 PyTorch 掉出 flash 后端？这和 FlashAttention 的设计目标有什么关系？
+16. EMA 论文给出三个不同的内存复杂度（$O(1)$ / $O(\log n)$ / $O(\sqrt n)$），分别对应什么设定？$O(\log n)$ 里的 log 是从哪来的？
 
 ---
 
-## 附录 A. 全部编号公式
+## 附录 C. 参考文献
 
-> 说明：原 PDF 中的公式为**矢量绘制**（无法直接提取文本），下述公式由页面图像 OCR + 上下文推导复原；符号沿用原文记号。
+1. Tri Dao, Daniel Y. Fu, Stefano Ermon, Atri Rudra, Christopher Ré.
+   **FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness.**
+   arXiv:2205.14135, 2022. <https://arxiv.org/abs/2205.14135>
+2. Tri Dao.
+   **FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning.**
+   arXiv:2307.08691, 2023. <https://arxiv.org/abs/2307.08691>
+3. Markus N. Rabe, Charles Staats.
+   **Self-attention Does Not Need O(n²) Memory.**
+   arXiv:2112.05682, 2021. <https://arxiv.org/abs/2112.05682>
 
-**Self-Attention 定义**
+**代码实现**
 
-```text
-(1)  S = Q Kᵀ        ∈ R^{N×N}
-(2)  P = softmax(S)  ∈ R^{N×N}
-(3)  O = P V         ∈ R^{N×d}
-```
-
-**稳定版 softmax（全局）**
-
-```text
-(4)  softmax(x_i) = e^{x_i} / Σⱼ e^{x_j}
-(5)  m(x)      = max([x₁, …, x_B])
-(6)  f(x)      = [ e^{x₁−m(x)}, …, e^{x_B−m(x)} ]
-(7)  ℓ(x)      = Σⱼ f(x)ⱼ                       ← EXP 求和项
-(8)  softmax(x)= f(x) / ℓ(x)
-```
-
-**第一个分块的局部 softmax**
-
-```text
-(9)   m(x⁽¹⁾)  = max([x₁⁽¹⁾, …, x_B⁽¹⁾])
-(10)  f(x⁽¹⁾)  = [ e^{x₁⁽¹⁾−m(x⁽¹⁾)}, …, e^{x_B⁽¹⁾−m(x⁽¹⁾)} ]
-(11)  ℓ(x⁽¹⁾)  = Σⱼ f(x⁽¹⁾)ⱼ
-(12)  softmax(x⁽¹⁾) = f(x⁽¹⁾) / ℓ(x⁽¹⁾)
-```
-
-**第二个分块的局部 softmax**
-
-```text
-(13)  m(x⁽²⁾)  = max([x₁⁽²⁾, …, x_B⁽²⁾])
-(14)  f(x⁽²⁾)  = [ e^{x₁⁽²⁾−m(x⁽²⁾)}, …, e^{x_B⁽²⁾−m(x⁽²⁾)} ]
-(15)  ℓ(x⁽²⁾)  = Σⱼ f(x⁽²⁾)ⱼ
-(16)  softmax(x⁽²⁾) = f(x⁽²⁾) / ℓ(x⁽²⁾)
-```
-
-**在线更新（动态更新）**
-
-```text
-(17)  m_max^new   = max([ m_max , m(x⁽²⁾) ])
-(18)  ℓ_max^new   = e^{m_max − m_max^new} · ℓ_max  +  e^{m(x⁽²⁾) − m_max^new} · ℓ(x⁽²⁾)
-(19)  ℓ(x⁽²⁾)     = Σⱼ e^{xⱼ⁽²⁾ − m(x⁽²⁾)}
-(20)  ℓ(x⁽²⁾) · e^{m(x⁽²⁾) − m_max^new} = Σⱼ e^{xⱼ⁽²⁾ − m_max^new}
-(21)  f(x⁽²⁾) · e^{m(x⁽²⁾) − m_max^new} = [ e^{x₁⁽²⁾−m_max^new}, …, e^{x_B⁽²⁾−m_max^new} ]
-(22)  softmax(x⁽²⁾)^new_num = f(x⁽²⁾) · e^{m(x⁽²⁾) − m_max^new} / ℓ(x⁽²⁾)
-(23)  softmax(x⁽²⁾)^new     = f(x⁽²⁾) · e^{m(x⁽²⁾) − m_max^new} / ℓ_max^new
-(24)  softmax(x⁽²⁾)^new     = softmax(x⁽²⁾) · [ ℓ(x⁽²⁾) · e^{m(x⁽²⁾) − m_max^new} ] / ℓ_max^new
-(25)  m_max^final = m_max^new
-(26)  ℓ_max^final = ℓ_max^new
-```
-
-**分块 Self-Attention**
-
-```text
-(27)  O_i ← diag(ℓ_i^new)⁻¹ ( diag(ℓ_i) e^{m_i − m_i^new} O_i  +  e^{m_i − m_i^new} P_{ij} V_j )
-(28)  softmax(x⁽³⁾)^new = softmax(x⁽³⁾) · [ ℓ(x⁽³⁾) · e^{m(x⁽³⁾) − m_max^new} ] / ℓ_max^new
-(29)  O_i = Σⱼ (更新后的 softmax(x⁽ʲ⁾)) · V_j
-```
-
-**v2 算法改进 / 反向合并**
-
-```text
-(30)  softmax(x⁽²⁾)^new     = ( f(x⁽²⁾) · e^{m(x⁽²⁾) − m_max^new} ) / ℓ_max^new      ← 即 (23)
-(31)  softmax(x⁽²⁾)^partial =   f(x⁽²⁾) · e^{m(x⁽²⁾) − m_max^new}                     ← 先不除分母
-(32)  P_{ij} = exp(S_{ij} − m_i) / ℓ_i
-(33)  P_{ij} = exp(S_{ij} − L_i)
-(34)  L_i = log(ℓ_i) + m_i
-```
-
-**Work Partitioning**
-
-```text
-(35)  S₁ = Q K₁ᵀ            ∈ R^{N×(N/4)}          (v1：切 K,V)
-(36)  P₁ = softmax(S₁)      ∈ R^{N×(N/4)}
-(37)  O₁ = P₁ V₁            ∈ R^{N×d}
-(38)  S₁ = Q₁ Kᵀ            ∈ R^{(N/4)×N}          (v2：切 Q)
-(39)  P₁ = softmax(S₁)      ∈ R^{(N/4)×N}
-(40)  O₁ = P₁ V             ∈ R^{(N/4)×d}
-```
-
-**EMA（Efficient Memory Attention）**
-
-```text
-(41)  s_i = q_i Kᵀ
-(42)  p_i = softmax(s_i)
-(43)  o_i = p_i V = Σⱼ p_{ij} v_j
-(44)  o_i = ( Σⱼ e^{s_{ij}} v_j ) / ( Σⱼ e^{s_{ij}} )
-(45)  num_i = Σ_{j≤i} e^{s_ij} v_j
-(46)  den_i = Σ_{j≤i} e^{s_ij}
-(47)  num_{i+1} = num_i + e^{s_{i,i+1}} v_{i+1}
-(48)  den_{i+1} = den_i + e^{s_{i,i+1}}
-```
+- FlashAttention v1: <https://github.com/HazyResearch/flash-attention>
+- FlashAttention v2: <https://github.com/Dao-AILab/flash-attention>
+- xformers（含 memory-efficient attention 系列算子）: <https://github.com/facebookresearch/xformers>
 
 ---
 
-## 附录 B. 参考资料
+### 说明
 
-1. **FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness** — <https://arxiv.org/abs/2205.14135>
-2. **FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning** — <https://arxiv.org/abs/2307.08691>
-3. **Self-attention Does Not Need O(n²) Memory** — <https://arxiv.org/abs/2112.05682>
-
-**说明与致谢**
-
-- 内容来源：知乎专栏 [《万字长文详解 FlashAttention v1/v2》](https://zhuanlan.zhihu.com/p/642962397)，作者 Civ，收录于专栏《Large Language Model》。
-- 本仓库为**学习笔记**性质：保留原文的推导主线、章节顺序与全部编号公式，补充了记号对照、复习清单与公式附录，便于检索与自测。
-- 原文公式在 PDF 中以矢量图形呈现，附录 A 的公式由页面图像 OCR 结合上下文语义恢复，个别上下标写法可能与原文排版略有差异；如发现偏差，以原论文为准。
+本笔记基于上述公开论文整理，公式、伪代码、复杂度结论与实验数字均取自论文正文，引用见附录 C。
+文中的手算验证示例（第 2.3 节）与总结性表格为整理者补充，用于自检与速查。
+若发现与论文不一致之处，**以论文为准**。
